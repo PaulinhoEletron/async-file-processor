@@ -1,0 +1,10 @@
+.env
+/bin/
+/coverage.out
+
+# Local development workflow notes (not part of the project)
+PLAN.md
+AGENTS.md
+CLAUDE.md
+reviews/
+.claude/
