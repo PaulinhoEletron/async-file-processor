@@ -1,14 +1,16 @@
 -include .env
 export
 
-.PHONY: up down test lint run-api run-worker
+.PHONY: up down clean test lint run-api run-worker
 
 up:
 	docker compose up -d --wait postgres minio elasticmq
-	docker compose run --rm --no-deps minio-init
 
 down:
 	docker compose down
+
+clean:
+	docker compose down -v
 
 test:
 	go test ./...

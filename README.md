@@ -25,11 +25,10 @@ allowing active requests up to `SHUTDOWN_TIMEOUT` to finish.
 The health endpoint checks the API process; a dependency readiness check is planned.
 
 `make up` starts Postgres, MinIO, and ElasticMQ and waits for their health checks.
-The MinIO initialization container creates the `uploads` bucket and exits successfully.
 ElasticMQ creates `jobs` and `jobs-dlq`, with redrive after three receives.
 Services bind only to localhost. Credentials in `.env.example` are for local development.
-MinIO and `mc` use public [Chainguard builds](https://images.chainguard.dev/directory/image/minio/overview),
-because the original MinIO Docker Hub and Quay images no longer allow anonymous pulls.
+MinIO uses a public [Chainguard build](https://images.chainguard.dev/directory/image/minio/overview),
+pinned by digest, because the original MinIO Docker Hub and Quay images no longer allow anonymous pulls.
 
 | Service | Address |
 | --- | --- |
@@ -51,7 +50,8 @@ make test
 make lint
 make run-worker
 make down
+make clean
 ```
 
 The worker currently waits for a shutdown signal; queue processing is in progress.
-`make down` preserves stored data. Use `docker compose down -v` to remove local data.
+`make down` preserves stored data. `make clean` stops the services and removes local data.

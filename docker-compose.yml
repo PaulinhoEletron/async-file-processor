@@ -16,7 +16,8 @@ services:
       retries: 20
 
   minio:
-    image: cgr.dev/chainguard/minio:latest
+    # Chainguard publishes only a floating tag; pin the digest (MinIO RELEASE.2026-10-23T20-06-51Z).
+    image: cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-local-access-key}
@@ -31,21 +32,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-
-  minio-init:
-    image: cgr.dev/chainguard/minio-client:latest-dev
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-local-access-key}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-local-secret-key}
-      S3_BUCKET: ${S3_BUCKET:-uploads}
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        mc alias set local http://minio:9000 "$$AWS_ACCESS_KEY_ID" "$$AWS_SECRET_ACCESS_KEY"
-        mc mb --ignore-existing "local/$$S3_BUCKET"
 
   elasticmq:
     image: softwaremill/elasticmq:1.6.12
