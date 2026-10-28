@@ -137,16 +137,12 @@ func (r *Repo) UpdateProgress(ctx context.Context, id string, total, valid, inva
 		 WHERE id = $1 AND status = 'PROCESSING'`, id, total, valid, invalid)
 }
 
-// Complete marks a job COMPLETED with its final counts and output keys. errorsKey may be empty.
+// Complete marks a job COMPLETED with its final counts and output keys. An empty key is stored as NULL.
 func (r *Repo) Complete(ctx context.Context, id, reportKey, errorsKey string, total, valid, invalid int64) error {
-	var ek *string
-	if errorsKey != "" {
-		ek = &errorsKey
-	}
 	return r.exec(ctx, id, "complete",
-		`UPDATE jobs SET status = 'COMPLETED', report_key = $2, errors_key = $3, total_rows = $4,
-		 valid_rows = $5, invalid_rows = $6, error_msg = NULL, finished_at = now(), updated_at = now()
-		 WHERE id = $1 AND status IN ('PENDING', 'PROCESSING')`, id, reportKey, ek, total, valid, invalid)
+		`UPDATE jobs SET status = 'COMPLETED', report_key = NULLIF($2, ''), errors_key = NULLIF($3, ''),
+		 total_rows = $4, valid_rows = $5, invalid_rows = $6, error_msg = NULL, finished_at = now(), updated_at = now()
+		 WHERE id = $1 AND status IN ('PENDING', 'PROCESSING')`, id, reportKey, errorsKey, total, valid, invalid)
 }
 
 // Fail marks a job FAILED with a message.

@@ -70,6 +70,21 @@ A job has the fields `id`, `filename`, `status` (`PENDING`, `PROCESSING`, `COMPL
 `total_rows`, `valid_rows`, `invalid_rows`, `attempts`, `error_msg`, `created_at`, `updated_at`,
 `started_at` and `finished_at`.
 
+## Worker
+
+`make run-worker` starts the queue consumer. It long-polls SQS and feeds a fixed pool of
+`WORKER_CONCURRENCY` goroutines (default 4). Messages are only requested when a pool slot is
+free, so work never waits in memory while its visibility timeout runs. For each message the
+worker claims the job (`PROCESSING`), runs the processor, marks the job `COMPLETED`, and deletes
+the message. Malformed messages, unknown jobs, and jobs that are already finished are discarded;
+a failed run leaves the message on the queue for redelivery. Log lines carry `job_id` and
+`worker`. Until CSV validation is implemented, the processor is a placeholder that waits
+`STUB_PROCESS_DELAY` (default 500ms) and reports zero rows.
+
+On SIGINT or SIGTERM the worker stops receiving, lets jobs already running finish for up to
+`SHUTDOWN_TIMEOUT`, and exits. Messages received but not yet started are left on the queue and
+become visible again. The worker does not run migrations: start the API once first.
+
 Application defaults are defined in `internal/config` and shown in `.env.example`.
 Make loads `.env`; when running Go directly, export the environment variables yourself.
 AWS credentials use the standard `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables.
@@ -85,5 +100,4 @@ make down
 make clean
 ```
 
-The worker currently waits for a shutdown signal; queue processing is in progress.
 `make down` preserves stored data. `make clean` stops the services and removes local data.
