@@ -26,6 +26,7 @@ The health endpoint checks the API process; a dependency readiness check is plan
 
 `make up` starts Postgres, MinIO, and ElasticMQ and waits for their health checks.
 ElasticMQ creates `jobs` and `jobs-dlq`, with redrive after three receives.
+The API applies database migrations and creates the S3 bucket if it is missing when it starts.
 Services bind only to localhost. Credentials in `.env.example` are for local development.
 MinIO uses a public [Chainguard build](https://images.chainguard.dev/directory/image/minio/overview),
 pinned by digest, because the original MinIO Docker Hub and Quay images no longer allow anonymous pulls.
@@ -47,6 +48,7 @@ Postgres uses host port 5433 to coexist with a local installation. If you change
 
 ```sh
 make test
+make test-integration   # needs `make up`; exercises Postgres, S3, and SQS
 make lint
 make run-worker
 make down
