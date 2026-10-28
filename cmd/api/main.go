@@ -13,6 +13,8 @@ import (
 
 	"async-file-processor/internal/config"
 	"async-file-processor/internal/httpapi"
+	"async-file-processor/internal/jobs"
+	"async-file-processor/internal/queue"
 	"async-file-processor/internal/storage"
 	"async-file-processor/migrations"
 
@@ -58,9 +60,17 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("bucket ready", "bucket", cfg.S3Bucket)
 
+	jobQueue, err := queue.New(startCtx, queue.Config{Region: cfg.AWSRegion, Endpoint: cfg.SQSEndpoint, QueueURL: cfg.SQSQueueURL})
+	if err != nil {
+		return err
+	}
+
+	// No Read/WriteTimeout: large uploads stream for as long as the client needs.
 	server := &http.Server{
-		Addr:              cfg.APIAddr,
-		Handler:           httpapi.NewHandler(),
+		Addr: cfg.APIAddr,
+		Handler: httpapi.NewHandler(httpapi.Deps{
+			Store: store, Jobs: jobs.NewRepo(pool), Queue: jobQueue, Logger: logger, MaxUploadBytes: cfg.MaxUploadBytes,
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
