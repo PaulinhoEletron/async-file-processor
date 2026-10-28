@@ -75,15 +75,77 @@ A job has the fields `id`, `filename`, `status` (`PENDING`, `PROCESSING`, `COMPL
 `make run-worker` starts the queue consumer. It long-polls SQS and feeds a fixed pool of
 `WORKER_CONCURRENCY` goroutines (default 4). Messages are only requested when a pool slot is
 free, so work never waits in memory while its visibility timeout runs. For each message the
-worker claims the job (`PROCESSING`), runs the processor, marks the job `COMPLETED`, and deletes
-the message. Malformed messages, unknown jobs, and jobs that are already finished are discarded;
-a failed run leaves the message on the queue for redelivery. Log lines carry `job_id` and
-`worker`. Until CSV validation is implemented, the processor is a placeholder that waits
-`STUB_PROCESS_DELAY` (default 500ms) and reports zero rows.
+worker claims the job (`PROCESSING`), validates the file, marks the job `COMPLETED`, and deletes
+the message. Malformed messages, unknown jobs, and jobs that are already finished are discarded.
+A file that can never be processed (empty, or with a wrong header) marks the job `FAILED` with
+an explanatory `error_msg` and deletes the message. Any other failure leaves the message on the
+queue for redelivery. Log lines carry `job_id` and `worker`.
 
 On SIGINT or SIGTERM the worker stops receiving, lets jobs already running finish for up to
 `SHUTDOWN_TIMEOUT`, and exits. Messages received but not yet started are left on the queue and
 become visible again. The worker does not run migrations: start the API once first.
+
+## CSV validation
+
+Files are read as a stream (`encoding/csv`, one record at a time), so memory use does not depend
+on file size. Invalid rows are written to `{job id}/errors.csv` as they are found, and the
+file is uploaded to S3 concurrently through a pipe.
+
+### Schema
+
+The header must be exactly `id,name,email,amount,date,country`, in that order. Surrounding spaces
+and a leading UTF-8 byte order mark are ignored. Spaces around values are ignored too.
+
+| Column | Rule |
+| --- | --- |
+| `id` | Required, a base-10 integer, unique within the file. |
+| `name` | Required, at most 100 characters. |
+| `email` | A bare address accepted by `net/mail`; `Name <a@b.com>` is rejected. |
+| `amount` | A plain decimal, 0 or greater: `10`, `10.50`, `0`. A sign, an exponent (`1e3`), `NaN` and `Inf` are rejected. |
+| `date` | `YYYY-MM-DD` and a real calendar date (`2024-02-30` is invalid). |
+| `country` | Exactly two uppercase ASCII letters. |
+
+A row with the wrong number of fields is a single error on the pseudo-field `row`. A row that
+is not well-formed CSV (for example a stray quote inside an unquoted field) is also reported on
+`row`, and processing continues with the next line. The header is stricter: if it is empty,
+wrong, or malformed, the job fails.
+
+Duplicate detection keeps every id seen so far in a set, a few tens of bytes per distinct
+id, so a file with tens of millions of unique ids needs gigabytes of memory. That is the one part of
+processing whose memory grows with the input. A row claims its id whenever the id parses, even if
+other columns are invalid; rows of the wrong width claim nothing.
+
+### errors.csv
+
+`{job id}/errors.csv` is always written, with only the header when every row is valid. Columns:
+`row,field,error,raw`. There is one line per failed rule, so a row with three problems
+appears three times. `row` is the 1-based data row number (the header is not counted), and
+`raw` is the original record re-encoded as CSV. For a row that is not well-formed CSV, `raw`
+is empty. Progress is written to the job (`total_rows`, `valid_rows`, `invalid_rows`)
+every 5000 rows and at completion.
+
+```csv
+row,field,error,raw
+5,email,must be a valid email address,"5,Eva Novak,not-an-email,10.00,2024-05-05,CZ"
+10,id,is a duplicate of an earlier row,"2,Duplicate Id,dup@example.com,9.99,2024-09-30,PT"
+```
+
+### Large test files
+
+`scripts/gencsv` writes a file in this schema without holding it in memory. `-bad` is the
+fraction of invalid rows, spread over every rule. It prints the exact number it generated to
+stderr, so job counts can be compared.
+
+```sh
+go run ./scripts/gencsv -rows 1000000 -bad 0.05 -seed 1 -out big.csv   # prints rows=1000000 bad=...
+curl -F file=@big.csv http://localhost:8080/api/jobs
+```
+
+Benchmark (local, MinIO and Postgres in Docker): a 1,000,000 row, 69 MB file with 49,751
+invalid rows processed in about 6 seconds (roughly 165,000 rows/s). The worker's resident memory
+peaked at about 85 MB with one such job, and about 280 MB with four running concurrently
+(`WORKER_CONCURRENCY=4`). Per-job memory is mostly the duplicate-id set and the upload buffer,
+so size the worker for `WORKER_CONCURRENCY` times the largest expected file.
 
 Application defaults are defined in `internal/config` and shown in `.env.example`.
 Make loads `.env`; when running Go directly, export the environment variables yourself.

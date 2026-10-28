@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -69,6 +70,17 @@ type fakeJobs struct {
 	claimErr  error
 	mu        sync.Mutex
 	completed map[string]bool
+	failed    map[string]string
+}
+
+func (j *fakeJobs) Fail(_ context.Context, id, msg string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.failed == nil {
+		j.failed = map[string]string{}
+	}
+	j.failed[id] = msg
+	return nil
 }
 
 func (j *fakeJobs) MarkProcessing(_ context.Context, id string) (jobs.Job, error) {
@@ -246,5 +258,22 @@ func TestShutdownTimeoutCancelsInFlight(t *testing.T) {
 	}
 	if q.deletedCount() != 0 {
 		t.Fatal("cancelled job must not be deleted")
+	}
+}
+
+func TestInvalidInputFailsJobAndDeletesMessage(t *testing.T) {
+	q, j := newFakeQueue(body(1)), &fakeJobs{}
+	p := &fakeProc{err: fmt.Errorf("%w: invalid header", processor.ErrInvalidInput)}
+	cancel, result := start(t, q, j, p, 2)
+	waitFor(t, func() bool { return q.deletedCount() == 1 })
+	cancel()
+	<-result
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if msg := j.failed["job-1"]; !strings.Contains(msg, "invalid header") {
+		t.Fatalf("failure message = %q", msg)
+	}
+	if len(j.completed) != 0 {
+		t.Fatal("invalid input must not complete the job")
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"async-file-processor/internal/jobs"
 	"async-file-processor/internal/processor"
 	"async-file-processor/internal/queue"
+	"async-file-processor/internal/storage"
 	"async-file-processor/internal/worker"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -53,7 +54,13 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	w := worker.New(jobQueue, jobs.NewRepo(pool), processor.Stub{Delay: cfg.StubDelay}, worker.Config{
+	store, err := storage.New(startCtx, storage.Config{Region: cfg.AWSRegion, Endpoint: cfg.S3Endpoint, Bucket: cfg.S3Bucket})
+	if err != nil {
+		return err
+	}
+
+	repo := jobs.NewRepo(pool)
+	w := worker.New(jobQueue, repo, processor.New(store, repo, logger), worker.Config{
 		Concurrency:     cfg.WorkerConcurrency,
 		PollWait:        queue.MaxWait,
 		ShutdownTimeout: cfg.ShutdownTimeout,

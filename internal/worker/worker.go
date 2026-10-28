@@ -30,6 +30,7 @@ type Queue interface {
 type Jobs interface {
 	MarkProcessing(ctx context.Context, id string) (jobs.Job, error)
 	Complete(ctx context.Context, id, reportKey, errorsKey string, total, valid, invalid int64) error
+	Fail(ctx context.Context, id, msg string) error
 }
 
 // Processor handles the contents of one claimed job.
@@ -176,6 +177,16 @@ func (w *Worker) handle(ctx context.Context, workerID int, m queue.Msg) {
 	start := time.Now()
 	log.Info("job started", "filename", job.Filename)
 	res, err := w.proc.Process(ctx, job)
+	if errors.Is(err, processor.ErrInvalidInput) {
+		// Retrying cannot fix the input: record the failure and drop the message.
+		if failErr := w.jobs.Fail(ctx, job.ID, err.Error()); failErr != nil {
+			log.Error("mark job failed; leaving message for redelivery", "error", failErr)
+			return
+		}
+		log.Warn("job failed: invalid input", "error", err, "duration", time.Since(start).String())
+		w.delete(ctx, workerID, m, p.JobID)
+		return
+	}
 	if err == nil {
 		err = w.jobs.Complete(ctx, job.ID, res.ReportKey, res.ErrorsKey, res.Total, res.Valid, res.Invalid)
 	}

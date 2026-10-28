@@ -2,14 +2,13 @@ package config
 
 import (
 	"testing"
-	"time"
 )
 
 func TestLoad(t *testing.T) {
 	for _, key := range []string{
 		"API_ADDR", "SHUTDOWN_TIMEOUT", "DATABASE_URL", "AWS_REGION",
 		"S3_ENDPOINT", "S3_BUCKET", "SQS_ENDPOINT", "SQS_QUEUE_URL",
-		"WORKER_CONCURRENCY", "MAX_UPLOAD_BYTES", "MAX_ATTEMPTS", "STUB_PROCESS_DELAY",
+		"WORKER_CONCURRENCY", "MAX_UPLOAD_BYTES", "MAX_ATTEMPTS",
 	} {
 		t.Setenv(key, "")
 	}
@@ -17,7 +16,7 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.APIAddr != ":8080" || cfg.WorkerConcurrency != 4 || cfg.S3Bucket != "uploads" || cfg.StubDelay != 500*time.Millisecond {
+	if cfg.APIAddr != ":8080" || cfg.WorkerConcurrency != 4 || cfg.S3Bucket != "uploads" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 	t.Setenv("API_ADDR", ":9090")
@@ -37,8 +36,6 @@ func TestLoad(t *testing.T) {
 		{"MAX_UPLOAD_BYTES", "-1"},
 		{"MAX_UPLOAD_BYTES", "9223372036854775808"},
 		{"MAX_ATTEMPTS", "0"},
-		{"STUB_PROCESS_DELAY", "-1s"},
-		{"STUB_PROCESS_DELAY", "slow"},
 	} {
 		t.Run(tc.key+"/"+tc.value, func(t *testing.T) {
 			t.Setenv(tc.key, tc.value)

@@ -20,7 +20,6 @@ type Config struct {
 	WorkerConcurrency int
 	MaxUploadBytes    int64
 	MaxAttempts       int
-	StubDelay         time.Duration
 }
 
 // Load reads settings once at startup. AWS credentials are left to the SDK's
@@ -39,10 +38,6 @@ func Load() (Config, error) {
 	c.ShutdownTimeout, err = time.ParseDuration(value("SHUTDOWN_TIMEOUT", "15s"))
 	if err != nil || c.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be a positive duration")
-	}
-	c.StubDelay, err = time.ParseDuration(value("STUB_PROCESS_DELAY", "500ms"))
-	if err != nil || c.StubDelay < 0 {
-		return Config{}, fmt.Errorf("STUB_PROCESS_DELAY must be a non-negative duration")
 	}
 	for _, setting := range []struct {
 		name     string
