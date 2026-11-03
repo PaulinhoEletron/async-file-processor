@@ -12,8 +12,9 @@ import (
 	"async-file-processor/internal/jobs"
 )
 
-// Store writes uploaded objects.
+// Store reads and writes objects.
 type Store interface {
+	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	Put(ctx context.Context, key string, r io.Reader) error
 	Delete(ctx context.Context, key string) error
 }
@@ -58,6 +59,8 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/jobs", a.createJob)
 	mux.HandleFunc("GET /api/jobs/{id}", a.getJob)
 	mux.HandleFunc("GET /api/jobs", a.listJobs)
+	mux.HandleFunc("GET /api/jobs/{id}/report", a.getReport)
+	mux.HandleFunc("GET /api/jobs/{id}/errors.csv", a.getErrorsCSV)
 	return requestID(logRequests(d.Logger, recoverPanics(d.Logger, mux)))
 }
 

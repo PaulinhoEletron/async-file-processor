@@ -3,11 +3,13 @@ package processor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -82,7 +84,7 @@ func TestProcessSample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Result{ErrorsKey: "job1/errors.csv", Total: 10, Valid: 4, Invalid: 6}
+	want := Result{ReportKey: "job1/summary.json", ErrorsKey: "job1/errors.csv", Total: 10, Valid: 4, Invalid: 6}
 	if res != want {
 		t.Fatalf("result = %+v, want %+v", res, want)
 	}
@@ -104,7 +106,7 @@ func TestProcessAllValidWritesHeaderOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Total != 2 || res.Valid != 2 || res.Invalid != 0 || res.ErrorsKey != "job1/errors.csv" || res.ReportKey != "" {
+	if res.Total != 2 || res.Valid != 2 || res.Invalid != 0 || res.ErrorsKey != "job1/errors.csv" || res.ReportKey != "job1/summary.json" {
 		t.Fatalf("result = %+v", res)
 	}
 	if got := store.objects["job1/errors.csv"]; got != "row,field,error,raw\n" {
@@ -269,5 +271,88 @@ func TestProcessUploaderStopsEarly(t *testing.T) {
 	_, err := p.Process(context.Background(), jobs.Job{ID: "job1", InputKey: "in"})
 	if err == nil || !strings.Contains(err.Error(), "upload aborted") {
 		t.Fatalf("err = %v, want upload aborted", err)
+	}
+}
+
+func TestProcessSummary(t *testing.T) {
+	in := header +
+		"1,A,a@example.com,1,2024-01-01,US\n" +
+		"2,,bad,1,2024-01-01,US\n" + // name required, email invalid
+		"3,C,c@example.com,-1,2024-01-01,US\n" + // amount negative
+		"1,D,d@example.com,1,2024-01-01,US\n" + // duplicate id
+		"5,E,e@example.com,1,2024-01-01\n" + // wrong width
+		"6,x\"y,f@example.com,1,2024-01-01,US\n" + // malformed csv
+		"7,G,g@example.com,1,2024-01-01,US\n"
+	store := newStore("in", in)
+	res, err := run(t, store, &fakeProgress{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ReportKey != SummaryKey("job1") || SummaryKey("job1") != "job1/summary.json" {
+		t.Fatalf("report key = %q", res.ReportKey)
+	}
+	var sum Summary
+	if err := json.Unmarshal([]byte(store.objects["job1/summary.json"]), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.JobID != "job1" || sum.TotalRows != 7 || sum.ValidRows != 2 || sum.InvalidRows != 5 || sum.ErrorCount != 6 {
+		t.Fatalf("summary = %+v", sum)
+	}
+	wantField := map[string]int64{"name": 1, "email": 1, "amount": 1, "id": 1, "row": 2}
+	wantRule := map[string]int64{"name.required": 1, "email.invalid_email": 1, "amount.negative": 1,
+		"id.duplicate": 1, "row.column_count": 1, "row.malformed_csv": 1}
+	if !reflect.DeepEqual(sum.ErrorsByField, wantField) {
+		t.Fatalf("errors_by_field = %v, want %v", sum.ErrorsByField, wantField)
+	}
+	if !reflect.DeepEqual(sum.ErrorsByRule, wantRule) {
+		t.Fatalf("errors_by_rule = %v, want %v", sum.ErrorsByRule, wantRule)
+	}
+	// error_count matches the data lines of errors.csv.
+	lines := strings.Count(store.objects["job1/errors.csv"], "\n") - 1
+	if int64(lines) != sum.ErrorCount {
+		t.Fatalf("errors.csv has %d lines, summary says %d", lines, sum.ErrorCount)
+	}
+	if sum.DurationMS < 0 || sum.RowsPerSec < 0 {
+		t.Fatalf("timing = %+v", sum)
+	}
+}
+
+func TestProcessAllValidSummaryHasEmptyMaps(t *testing.T) {
+	store := newStore("in", header+"1,A,a@example.com,1,2024-01-01,US\n")
+	if _, err := run(t, store, &fakeProgress{}); err != nil {
+		t.Fatal(err)
+	}
+	got := store.objects["job1/summary.json"]
+	if !strings.Contains(got, `"errors_by_field":{}`) || !strings.Contains(got, `"errors_by_rule":{}`) || !strings.Contains(got, `"error_count":0`) {
+		t.Fatalf("summary = %s", got)
+	}
+}
+
+func TestProcessNoSummaryOnInvalidHeader(t *testing.T) {
+	store := newStore("in", "a,b,c\n1,2,3\n")
+	if _, err := run(t, store, &fakeProgress{}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, ok := store.objects["job1/summary.json"]; ok || len(store.putKeys) != 0 {
+		t.Fatalf("objects written: %v", store.putKeys)
+	}
+}
+
+// summaryFailStore fails only the summary upload.
+type summaryFailStore struct{ *fakeStore }
+
+func (s summaryFailStore) Put(ctx context.Context, key string, r io.Reader) error {
+	if key == SummaryKey("job1") {
+		return errors.New("summary refused")
+	}
+	return s.fakeStore.Put(ctx, key, r)
+}
+
+func TestProcessSummaryUploadFailure(t *testing.T) {
+	base := newStore("in", header+"1,A,a@example.com,1,2024-01-01,US\n")
+	p := New(summaryFailStore{base}, &fakeProgress{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	res, err := p.Process(context.Background(), jobs.Job{ID: "job1", InputKey: "in"})
+	if err == nil || !strings.Contains(err.Error(), "summary refused") || res.ReportKey != "" {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 }

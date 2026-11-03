@@ -22,7 +22,19 @@ import (
 type fakeStore struct {
 	objects map[string]string
 	putErr  error
+	getErr  error
 	deleted []string
+}
+
+func (f *fakeStore) Get(_ context.Context, key string) (io.ReadCloser, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	c, ok := f.objects[key]
+	if !ok {
+		return nil, errors.New("no such key")
+	}
+	return io.NopCloser(strings.NewReader(c)), nil
 }
 
 func (f *fakeStore) Put(_ context.Context, key string, r io.Reader) error {

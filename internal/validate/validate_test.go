@@ -93,6 +93,9 @@ func TestValidateRowFields(t *testing.T) {
 				if e.Message == "" {
 					t.Errorf("empty message for field %s", e.Field)
 				}
+				if e.Rule == "" {
+					t.Errorf("empty rule for field %s", e.Field)
+				}
 				got = append(got, e.Field)
 			}
 			if !reflect.DeepEqual(got, tc.want) {
@@ -136,5 +139,39 @@ func TestValidateRowClaimsIDEvenWhenRowInvalid(t *testing.T) {
 	}
 	if errs := v.ValidateRow(row("5", "B", "b@example.com", "1", "2024-01-15", "US")); len(errs) != 1 || errs[0].Field != "id" {
 		t.Fatalf("second: %v", errs)
+	}
+}
+
+func TestValidateRowRuleCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rec  []string
+		want []FieldError
+	}{
+		{"required", row("", "", "", "", "", ""), []FieldError{
+			{Field: "id", Rule: RuleRequired}, {Field: "name", Rule: RuleRequired}, {Field: "email", Rule: RuleRequired},
+			{Field: "amount", Rule: RuleRequired}, {Field: "date", Rule: RuleRequired}, {Field: "country", Rule: RuleRequired}}},
+		{"format rules", row("x", strings.Repeat("a", 101), "bad", "abc", "nope", "xx"), []FieldError{
+			{Field: "id", Rule: RuleNotInteger}, {Field: "name", Rule: RuleTooLong}, {Field: "email", Rule: RuleInvalidEmail},
+			{Field: "amount", Rule: RuleInvalidDecimal}, {Field: "date", Rule: RuleInvalidDate}, {Field: "country", Rule: RuleInvalidCountry}}},
+		{"negative", row("1", "A", "a@example.com", "-1", "2024-01-15", "US"), []FieldError{{Field: "amount", Rule: RuleNegative}}},
+		{"column count", row("1", "A", "a@example.com", "1", "2024-01-15", "US")[:3], []FieldError{{Field: RowField, Rule: RuleColumnCount}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []FieldError
+			for _, e := range NewValidator().ValidateRow(tc.rec) {
+				e.Message = ""
+				got = append(got, e)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	v := NewValidator()
+	v.ValidateRow(row("1", "A", "a@example.com", "1", "2024-01-15", "US"))
+	errs := v.ValidateRow(row("1", "A", "a@example.com", "1", "2024-01-15", "US"))
+	if len(errs) != 1 || errs[0].Rule != RuleDuplicate {
+		t.Fatalf("duplicate: %+v", errs)
 	}
 }

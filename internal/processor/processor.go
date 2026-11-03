@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"async-file-processor/internal/jobs"
 	"async-file-processor/internal/validate"
@@ -23,6 +25,21 @@ const ProgressEvery = 5000
 // ErrInvalidInput marks input that can never be processed successfully, such as a missing or
 // wrong header. Retrying the job will not help.
 var ErrInvalidInput = errors.New("invalid input file")
+
+// Summary is the report written to {id}/summary.json once a job has been processed. Error
+// counts are kept per field and per field and rule, so memory does not grow with the input.
+type Summary struct {
+	JobID         string           `json:"job_id"`
+	TotalRows     int64            `json:"total_rows"`
+	ValidRows     int64            `json:"valid_rows"`
+	InvalidRows   int64            `json:"invalid_rows"`
+	ErrorCount    int64            `json:"error_count"`
+	ErrorsByField map[string]int64 `json:"errors_by_field"`
+	// ErrorsByRule is keyed "field.rule", for example "email.invalid_email".
+	ErrorsByRule map[string]int64 `json:"errors_by_rule"`
+	DurationMS   int64            `json:"duration_ms"`
+	RowsPerSec   float64          `json:"rows_per_sec"`
+}
 
 // errorsHeader is the first line of every errors file.
 var errorsHeader = []string{"row", "field", "error", "raw"}
@@ -62,13 +79,18 @@ func New(store Store, progress Progress, logger *slog.Logger) *Processor {
 // ErrorsKey returns the object key of the errors file for a job.
 func ErrorsKey(jobID string) string { return jobID + "/errors.csv" }
 
+// SummaryKey returns the object key of the summary report for a job.
+func SummaryKey(jobID string) string { return jobID + "/summary.json" }
+
 // Process reads the job's input, validates every row, and uploads {id}/errors.csv with one line
-// per failed rule. The errors file is always written, header only when every row is valid.
+// per failed rule, then uploads {id}/summary.json. The errors file is always written, header
+// only when every row is valid. The summary is written only after the errors file is stored.
 //
 // Input that cannot be processed (empty file, wrong header, unreadable CSV structure) returns an
 // error wrapping ErrInvalidInput. A row that is malformed CSV (for example a stray quote) is
 // reported as a row error and processing continues with the next line.
 func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err error) {
+	start := time.Now()
 	body, err := p.store.Get(ctx, job.InputKey)
 	if err != nil {
 		return Result{}, fmt.Errorf("read input: %w", err)
@@ -99,7 +121,11 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 		pr.CloseWithError(err) // unblocks the writer if the upload stops early; nil acts like io.ErrClosedPipe
 		uploaded <- err
 	}()
+	uploadDone := false
 	defer func() {
+		if uploadDone {
+			return
+		}
 		// Close the pipe with the processing error so a partial upload is aborted, then wait for
 		// the uploader. An upload failure surfaces only when processing itself succeeded.
 		pw.CloseWithError(err)
@@ -113,6 +139,7 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 		return Result{}, fmt.Errorf("write errors file: %w", err)
 	}
 
+	sum := Summary{JobID: job.ID, ErrorsByField: map[string]int64{}, ErrorsByRule: map[string]int64{}}
 	v := validate.NewValidator()
 	var rawBuf bytes.Buffer
 	raw := csv.NewWriter(&rawBuf)
@@ -133,7 +160,7 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 		var rawRec string
 		switch {
 		case errors.As(readErr, &perr):
-			errs = []validate.FieldError{{Field: validate.RowField, Message: fmt.Sprintf("malformed CSV at line %d, column %d: %v", perr.Line, perr.Column, perr.Err)}}
+			errs = []validate.FieldError{{Field: validate.RowField, Rule: validate.RuleMalformedCSV, Message: fmt.Sprintf("malformed CSV at line %d, column %d: %v", perr.Line, perr.Column, perr.Err)}}
 		case readErr != nil:
 			return Result{}, fmt.Errorf("read input: %w", readErr)
 		default:
@@ -150,6 +177,9 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 			res.Invalid++
 			rowNum := strconv.FormatInt(res.Total, 10)
 			for _, fe := range errs {
+				sum.ErrorCount++
+				sum.ErrorsByField[fe.Field]++
+				sum.ErrorsByRule[fe.Field+"."+fe.Rule]++
 				if err := out.Write([]string{rowNum, fe.Field, fe.Message, rawRec}); err != nil {
 					return Result{}, fmt.Errorf("write errors file: %w", err)
 				}
@@ -166,6 +196,28 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 	if err := out.Error(); err != nil {
 		return Result{}, fmt.Errorf("write errors file: %w", err)
 	}
+	// Finish the errors upload before reporting on it.
+	pw.Close()
+	uploadErr := <-uploaded
+	uploadDone = true
+	if uploadErr != nil {
+		return Result{}, fmt.Errorf("upload errors file: %w", uploadErr)
+	}
 	res.ErrorsKey = key
+
+	sum.TotalRows, sum.ValidRows, sum.InvalidRows = res.Total, res.Valid, res.Invalid
+	elapsed := time.Since(start)
+	sum.DurationMS = elapsed.Milliseconds()
+	if elapsed > 0 {
+		sum.RowsPerSec = float64(res.Total) / elapsed.Seconds()
+	}
+	data, err := json.Marshal(sum)
+	if err != nil {
+		return Result{}, fmt.Errorf("encode summary: %w", err)
+	}
+	if err := p.store.Put(ctx, SummaryKey(job.ID), bytes.NewReader(data)); err != nil {
+		return Result{}, fmt.Errorf("upload summary: %w", err)
+	}
+	res.ReportKey = SummaryKey(job.ID)
 	return res, nil
 }

@@ -21,9 +21,26 @@ const RowField = "row"
 
 // FieldError describes one failed rule for one field.
 type FieldError struct {
-	Field   string
+	Field string
+	// Rule is a short stable code for the failed rule, such as "required" or "invalid_email".
+	Rule    string
 	Message string
 }
+
+// Rule codes reported in FieldError.Rule.
+const (
+	RuleRequired       = "required"
+	RuleNotInteger     = "not_integer"
+	RuleDuplicate      = "duplicate"
+	RuleTooLong        = "too_long"
+	RuleInvalidEmail   = "invalid_email"
+	RuleInvalidDecimal = "invalid_decimal"
+	RuleNegative       = "negative"
+	RuleInvalidDate    = "invalid_date"
+	RuleInvalidCountry = "invalid_country"
+	RuleColumnCount    = "column_count"
+	RuleMalformedCSV   = "malformed_csv"
+)
 
 // ValidateHeader checks that rec is exactly the expected header. Surrounding spaces and a
 // leading UTF-8 byte order mark are ignored.
@@ -64,83 +81,83 @@ func NewValidator() *Validator {
 // other fields are invalid.
 func (v *Validator) ValidateRow(rec []string) []FieldError {
 	if len(rec) != len(Header) {
-		return []FieldError{{RowField, fmt.Sprintf("expected %d fields, got %d", len(Header), len(rec))}}
+		return []FieldError{{RowField, RuleColumnCount, fmt.Sprintf("expected %d fields, got %d", len(Header), len(rec))}}
 	}
 	var errs []FieldError
-	add := func(field, msg string) { errs = append(errs, FieldError{field, msg}) }
+	add := func(field, rule, msg string) { errs = append(errs, FieldError{field, rule, msg}) }
 
-	if msg := v.checkID(strings.TrimSpace(rec[0])); msg != "" {
-		add("id", msg)
+	if rule, msg := v.checkID(strings.TrimSpace(rec[0])); rule != "" {
+		add("id", rule, msg)
 	}
-	if msg := checkName(strings.TrimSpace(rec[1])); msg != "" {
-		add("name", msg)
+	if rule, msg := checkName(strings.TrimSpace(rec[1])); rule != "" {
+		add("name", rule, msg)
 	}
-	if msg := checkEmail(strings.TrimSpace(rec[2])); msg != "" {
-		add("email", msg)
+	if rule, msg := checkEmail(strings.TrimSpace(rec[2])); rule != "" {
+		add("email", rule, msg)
 	}
-	if msg := checkAmount(strings.TrimSpace(rec[3])); msg != "" {
-		add("amount", msg)
+	if rule, msg := checkAmount(strings.TrimSpace(rec[3])); rule != "" {
+		add("amount", rule, msg)
 	}
-	if msg := checkDate(strings.TrimSpace(rec[4])); msg != "" {
-		add("date", msg)
+	if rule, msg := checkDate(strings.TrimSpace(rec[4])); rule != "" {
+		add("date", rule, msg)
 	}
-	if msg := checkCountry(strings.TrimSpace(rec[5])); msg != "" {
-		add("country", msg)
+	if rule, msg := checkCountry(strings.TrimSpace(rec[5])); rule != "" {
+		add("country", rule, msg)
 	}
 	return errs
 }
 
-func (v *Validator) checkID(s string) string {
+func (v *Validator) checkID(s string) (string, string) {
 	if s == "" {
-		return "is required"
+		return RuleRequired, "is required"
 	}
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return "must be an integer"
+		return RuleNotInteger, "must be an integer"
 	}
 	if _, dup := v.seen[n]; dup {
-		return "is a duplicate of an earlier row"
+		return RuleDuplicate, "is a duplicate of an earlier row"
 	}
 	v.seen[n] = struct{}{}
-	return ""
+	return "", ""
 }
 
-func checkName(s string) string {
+func checkName(s string) (string, string) {
 	if s == "" {
-		return "is required"
+		return RuleRequired, "is required"
 	}
 	if utf8.RuneCountInString(s) > MaxNameLen {
-		return fmt.Sprintf("must be at most %d characters", MaxNameLen)
+		return RuleTooLong, fmt.Sprintf("must be at most %d characters", MaxNameLen)
 	}
-	return ""
+	return "", ""
 }
 
 // checkEmail accepts only a bare address: "Name <a@b.c>" parses with net/mail but is rejected.
-func checkEmail(s string) string {
+func checkEmail(s string) (string, string) {
 	if s == "" {
-		return "is required"
+		return RuleRequired, "is required"
 	}
 	addr, err := mail.ParseAddress(s)
 	if err != nil || addr.Address != s {
-		return "must be a valid email address"
+		return RuleInvalidEmail, "must be a valid email address"
 	}
-	return ""
+	return "", ""
 }
 
 // checkAmount accepts plain decimals such as "10", "10.5" or "0.99". Signs, exponents
 // ("1e3"), NaN and Inf are rejected; a leading "-" is reported as negative.
-func checkAmount(s string) string {
+func checkAmount(s string) (string, string) {
 	if s == "" {
-		return "is required"
+		return RuleRequired, "is required"
 	}
 	digits := strings.TrimPrefix(s, "-")
 	if !isDecimal(digits) {
-		return "must be a decimal number"
+		return RuleInvalidDecimal, "must be a decimal number"
 	}
 	if digits != s {
-		return "must be greater than or equal to 0"
+		return RuleNegative, "must be greater than or equal to 0"
 	}
-	return ""
+	return "", ""
 }
 
 func isDecimal(s string) bool {
@@ -160,22 +177,22 @@ func allDigits(s string) bool {
 	return true
 }
 
-func checkDate(s string) string {
+func checkDate(s string) (string, string) {
 	if s == "" {
-		return "is required"
+		return RuleRequired, "is required"
 	}
 	if _, err := time.Parse("2006-01-02", s); err != nil {
-		return "must be a valid date in YYYY-MM-DD format"
+		return RuleInvalidDate, "must be a valid date in YYYY-MM-DD format"
 	}
-	return ""
+	return "", ""
 }
 
-func checkCountry(s string) string {
+func checkCountry(s string) (string, string) {
 	if s == "" {
-		return "is required"
+		return RuleRequired, "is required"
 	}
 	if len(s) != 2 || s[0] < 'A' || s[0] > 'Z' || s[1] < 'A' || s[1] > 'Z' {
-		return "must be two uppercase letters"
+		return RuleInvalidCountry, "must be two uppercase letters"
 	}
-	return ""
+	return "", ""
 }

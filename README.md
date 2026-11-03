@@ -66,6 +66,20 @@ curl http://localhost:8080/api/jobs/<id>
 curl "http://localhost:8080/api/jobs?limit=10"
 ```
 
+**Get the report** - `GET /api/jobs/{id}/report` returns the job's `summary.json` (see below).
+
+**Download the errors file** - `GET /api/jobs/{id}/errors.csv` streams `errors.csv` as an
+attachment named `<uploaded name>-errors.csv`.
+
+Both return `409` while the job is `PENDING`, `PROCESSING` or `FAILED`, `404` for an unknown id
+and `400` for a malformed id. Locally the API proxies downloads; on AWS these would be
+presigned S3 URLs.
+
+```sh
+curl http://localhost:8080/api/jobs/<id>/report
+curl -OJ http://localhost:8080/api/jobs/<id>/errors.csv
+```
+
 A job has the fields `id`, `filename`, `status` (`PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`),
 `total_rows`, `valid_rows`, `invalid_rows`, `attempts`, `error_msg`, `created_at`, `updated_at`,
 `started_at` and `finished_at`.
@@ -129,6 +143,31 @@ row,field,error,raw
 5,email,must be a valid email address,"5,Eva Novak,not-an-email,10.00,2024-05-05,CZ"
 10,id,is a duplicate of an earlier row,"2,Duplicate Id,dup@example.com,9.99,2024-09-30,PT"
 ```
+
+### summary.json
+
+`{job id}/summary.json` is written after the errors file has been stored. Error counts are kept
+per field and per `field.rule`, so building the summary uses no per-row memory. `error_count` is
+the number of lines in `errors.csv`; `invalid_rows` is the number of distinct rows with errors.
+
+```json
+{
+  "job_id": "…",
+  "total_rows": 10,
+  "valid_rows": 4,
+  "invalid_rows": 6,
+  "error_count": 6,
+  "errors_by_field": {"email": 1, "name": 1, "amount": 1, "date": 1, "country": 1, "id": 1},
+  "errors_by_rule": {"email.invalid_email": 1, "name.required": 1, "amount.negative": 1,
+                     "date.invalid_date": 1, "country.invalid_country": 1, "id.duplicate": 1},
+  "duration_ms": 3,
+  "rows_per_sec": 3333.3
+}
+```
+
+Rule codes: `required`, `not_integer`, `duplicate`, `too_long`, `invalid_email`,
+`invalid_decimal`, `negative`, `invalid_date`, `invalid_country`, plus `column_count` and
+`malformed_csv` on the pseudo-field `row`.
 
 ### Large test files
 
