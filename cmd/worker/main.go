@@ -19,6 +19,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// heartbeatInterval is how often a running job extends its message's visibility.
+const heartbeatInterval = 20 * time.Second
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
@@ -60,10 +63,19 @@ func run(logger *slog.Logger) error {
 	}
 
 	repo := jobs.NewRepo(pool)
-	w := worker.New(jobQueue, repo, processor.New(store, repo, logger), worker.Config{
+	var proc worker.Processor = processor.New(store, repo, logger)
+	if cfg.FailRate > 0 {
+		logger.Warn("fault injection enabled; for development only", "fail_rate", cfg.FailRate)
+		proc = worker.FaultyProcessor{Next: proc, Rate: cfg.FailRate}
+	}
+	w := worker.New(jobQueue, repo, proc, worker.Config{
 		Concurrency:     cfg.WorkerConcurrency,
 		PollWait:        queue.MaxWait,
 		ShutdownTimeout: cfg.ShutdownTimeout,
+		MaxAttempts:     cfg.MaxAttempts,
+		// Matches the jobs queue's defaultVisibilityTimeout in deploy/elasticmq.conf.
+		VisibilityTimeout: 60 * time.Second,
+		HeartbeatInterval: heartbeatInterval,
 	}, logger)
 	logger.Info("worker started", "concurrency", cfg.WorkerConcurrency)
 	if err := w.Run(ctx); err != nil {

@@ -112,11 +112,14 @@ func (r *Repo) List(ctx context.Context, limit int) ([]Job, error) {
 }
 
 // MarkProcessing atomically claims a PENDING or PROCESSING job (PROCESSING lets a redelivered
-// message reclaim a job whose worker died). It returns ErrNotFound for an unknown id and
+// message reclaim a job whose worker died). Every claim counts as an attempt and resets the
+// counters and output keys, so a re-run starts from a clean slate. It returns ErrNotFound for an unknown id and
 // ErrNotClaimable when the job is already COMPLETED or FAILED.
 func (r *Repo) MarkProcessing(ctx context.Context, id string) (Job, error) {
 	j, err := scan(r.pool.QueryRow(ctx,
-		`UPDATE jobs SET status = 'PROCESSING', started_at = COALESCE(started_at, now()), updated_at = now()
+		`UPDATE jobs SET status = 'PROCESSING', started_at = COALESCE(started_at, now()),
+		 attempts = attempts + 1, total_rows = 0, valid_rows = 0, invalid_rows = 0,
+		 error_msg = NULL, report_key = NULL, errors_key = NULL, updated_at = now()
 		 WHERE id = $1 AND status IN ('PENDING', 'PROCESSING') RETURNING `+columns, id))
 	if errors.Is(err, ErrNotFound) {
 		if _, getErr := r.Get(ctx, id); getErr != nil {
@@ -150,20 +153,6 @@ func (r *Repo) Fail(ctx context.Context, id, msg string) error {
 	return r.exec(ctx, id, "fail",
 		`UPDATE jobs SET status = 'FAILED', error_msg = $2, finished_at = now(), updated_at = now()
 		 WHERE id = $1 AND status IN ('PENDING', 'PROCESSING')`, id, msg)
-}
-
-// IncAttempts increments the attempt counter and returns the new value.
-func (r *Repo) IncAttempts(ctx context.Context, id string) (int, error) {
-	var n int
-	err := r.pool.QueryRow(ctx,
-		`UPDATE jobs SET attempts = attempts + 1, updated_at = now() WHERE id = $1 RETURNING attempts`, id).Scan(&n)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("increment attempts %s: %w", id, ErrNotFound)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("increment attempts %s: %w", id, err)
-	}
-	return n, nil
 }
 
 // exec runs a single-row update and maps zero affected rows to ErrNotFound or ErrNotClaimable.

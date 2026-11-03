@@ -95,9 +95,36 @@ A file that can never be processed (empty, or with a wrong header) marks the job
 an explanatory `error_msg` and deletes the message. Any other failure leaves the message on the
 queue for redelivery. Log lines carry `job_id` and `worker`.
 
-On SIGINT or SIGTERM the worker stops receiving, lets jobs already running finish for up to
-`SHUTDOWN_TIMEOUT`, and exits. Messages received but not yet started are left on the queue and
-become visible again. The worker does not run migrations: start the API once first.
+On SIGINT or SIGTERM the worker stops issuing new receives and lets jobs already running finish
+for up to `SHUTDOWN_TIMEOUT`. A receive already in flight is allowed to finish (up to the 20s
+long-poll), because abandoning it would let the queue hand a message to a dead request and hide
+it for the whole visibility timeout. Messages received after shutdown began, or received but not
+yet started, are released immediately so another worker picks them up without waiting for the
+visibility timeout. Shutdown can therefore take up to 20s longer when the queue is idle. A job
+cut off by the shutdown timeout is not counted as a failure; its message simply becomes visible
+again. The worker does not run migrations: start the API once first.
+
+### Retries and failures
+
+- **Permanent failures** (empty file, wrong header) mark the job `FAILED` after one attempt and
+  delete the message. Retrying cannot help.
+- **Transient failures** (S3, database, or network errors) leave the message on the queue with
+  its visibility set to `min(5s * 2^attempt, 5m)` (10s after the first attempt, 20s after the
+  second, and so on), so it is redelivered after the backoff.
+- **Attempts** are counted when a worker claims the job (or taken from the message's receive
+  count, if higher), so a worker that crashes mid-file also uses up an attempt. After
+  `MAX_ATTEMPTS` (default 3) the job is marked `FAILED` with `giving up after N attempts: ...`
+  and the message is released without being deleted. The queue's redrive policy then moves it
+  to the dead-letter queue (`jobs-dlq`) instead of delivering it again. `MAX_ATTEMPTS` must
+  equal the queue's `maxReceiveCount` (`deploy/elasticmq.conf`).
+- **Heartbeat:** while a file is processed the worker extends the message's visibility every
+  20s, so a large file is not redelivered to another worker. If the worker dies, the message
+  becomes visible after the visibility timeout (60s) and another worker takes the job over.
+- **Idempotent re-run:** claiming a job resets its row counters, error message, and output keys,
+  and a retry overwrites the same report and error-file objects in S3.
+- **Fault injection (development only):** `FAIL_RATE=0.3 make run-worker` makes the worker fail
+  30% of attempts with an injected transient error, which demonstrates retries (`attempts` above
+  1 in the job status) and, occasionally, a job exhausted into the dead-letter queue.
 
 ## CSV validation
 

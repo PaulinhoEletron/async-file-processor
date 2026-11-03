@@ -172,17 +172,19 @@ func TestJobs(t *testing.T) {
 	t.Run("claim and complete", func(t *testing.T) {
 		id := newJob(t)
 		j, err := repo.MarkProcessing(ctx, id)
-		if err != nil || j.Status != jobs.StatusProcessing || j.StartedAt == nil {
+		if err != nil || j.Status != jobs.StatusProcessing || j.StartedAt == nil || j.Attempts != 1 {
 			t.Fatalf("MarkProcessing = %+v, %v", j, err)
-		}
-		if _, err := repo.MarkProcessing(ctx, id); err != nil {
-			t.Fatalf("reclaiming a PROCESSING job: %v", err)
 		}
 		if err := repo.UpdateProgress(ctx, id, 10, 8, 2); err != nil {
 			t.Fatal(err)
 		}
-		if n, err := repo.IncAttempts(ctx, id); err != nil || n != 1 {
-			t.Fatalf("IncAttempts = %d, %v", n, err)
+		j, err = repo.MarkProcessing(ctx, id)
+		if err != nil {
+			t.Fatalf("reclaiming a PROCESSING job: %v", err)
+		}
+		if j.Attempts != 2 || j.TotalRows != 0 || j.ValidRows != 0 || j.InvalidRows != 0 ||
+			j.ErrorMsg != nil || j.ReportKey != nil || j.ErrorsKey != nil {
+			t.Fatalf("reclaim must count an attempt and reset counters: %+v", j)
 		}
 		if err := repo.Complete(ctx, id, "reports/"+id+".json", "", 100, 90, 10); err != nil {
 			t.Fatal(err)
@@ -192,7 +194,7 @@ func TestJobs(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got.Status != jobs.StatusCompleted || got.TotalRows != 100 || got.ValidRows != 90 || got.InvalidRows != 10 ||
-			got.ReportKey == nil || got.ErrorsKey != nil || got.FinishedAt == nil || got.Attempts != 1 {
+			got.ReportKey == nil || got.ErrorsKey != nil || got.FinishedAt == nil || got.Attempts != 2 {
 			t.Fatalf("unexpected completed job: %+v", got)
 		}
 		if _, err := repo.MarkProcessing(ctx, id); !errors.Is(err, jobs.ErrNotClaimable) {

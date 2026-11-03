@@ -23,6 +23,7 @@ type fakeQueue struct {
 	deleted   map[string]bool
 	maxLimit  int
 	delivered int
+	events    []string // "delete" and "vis:<duration>" in call order
 }
 
 func newFakeQueue(bodies ...string) *fakeQueue {
@@ -57,7 +58,21 @@ func (q *fakeQueue) Delete(_ context.Context, receipt string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.deleted[receipt] = true
+	q.events = append(q.events, "delete")
 	return nil
+}
+
+func (q *fakeQueue) ChangeVisibility(_ context.Context, _ string, timeout time.Duration) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.events = append(q.events, "vis:"+timeout.String())
+	return nil
+}
+
+func (q *fakeQueue) snapshot() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]string(nil), q.events...)
 }
 
 func (q *fakeQueue) deletedCount() int {
@@ -68,6 +83,7 @@ func (q *fakeQueue) deletedCount() int {
 
 type fakeJobs struct {
 	claimErr  error
+	attempts  int // attempt number reported by MarkProcessing; 0 means 1
 	mu        sync.Mutex
 	completed map[string]bool
 	failed    map[string]string
@@ -87,7 +103,7 @@ func (j *fakeJobs) MarkProcessing(_ context.Context, id string) (jobs.Job, error
 	if j.claimErr != nil {
 		return jobs.Job{}, j.claimErr
 	}
-	return jobs.Job{ID: id}, nil
+	return jobs.Job{ID: id, Attempts: max(j.attempts, 1)}, nil
 }
 
 func (j *fakeJobs) Complete(_ context.Context, id, _, _ string, _, _, _ int64) error {
@@ -98,6 +114,13 @@ func (j *fakeJobs) Complete(_ context.Context, id, _, _ string, _, _, _ int64) e
 	}
 	j.completed[id] = true
 	return nil
+}
+
+func (j *fakeJobs) failedMsg(id string) (string, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	m, ok := j.failed[id]
+	return m, ok
 }
 
 func (j *fakeJobs) completedCount() int {
@@ -210,15 +233,119 @@ func TestMalformedBodyIsDeleted(t *testing.T) {
 	}
 }
 
-func TestProcessorErrorLeavesMessage(t *testing.T) {
-	q, j, p := newFakeQueue(body(1)), &fakeJobs{}, &fakeProc{err: errors.New("boom")}
+func startCfg(t *testing.T, q Queue, j Jobs, p Processor, cfg Config) (cancel context.CancelFunc, result <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	w := New(q, j, p, cfg, quiet())
+	res := make(chan error, 1)
+	go func() { res <- w.Run(ctx) }()
+	t.Cleanup(cancel)
+	return cancel, res
+}
+
+func TestBackoff(t *testing.T) {
+	for attempt, want := range map[int]time.Duration{
+		1: 10 * time.Second, 2: 20 * time.Second, 3: 40 * time.Second, 5: 160 * time.Second,
+		6: 5 * time.Minute, 40: 5 * time.Minute, 100: 5 * time.Minute,
+	} {
+		if got := backoff(attempt); got != want {
+			t.Errorf("backoff(%d) = %v, want %v", attempt, got, want)
+		}
+	}
+}
+
+func TestTransientErrorBacksOffWithoutDeleteOrFail(t *testing.T) {
+	q, j, p := newFakeQueue(body(1)), &fakeJobs{attempts: 1}, &fakeProc{err: errors.New("boom")}
 	cancel, result := start(t, q, j, p, 2)
-	waitFor(t, func() bool { return p.calls.Load() == 1 })
-	time.Sleep(20 * time.Millisecond)
+	waitFor(t, func() bool { return len(q.snapshot()) == 1 })
 	cancel()
 	<-result
-	if q.deletedCount() != 0 || j.completedCount() != 0 {
-		t.Fatal("failed job must not be deleted or completed")
+	if ev := q.snapshot(); len(ev) != 1 || ev[0] != "vis:10s" {
+		t.Fatalf("events = %v, want [vis:10s]", ev)
+	}
+	if _, failed := j.failedMsg("job-1"); failed || q.deletedCount() != 0 || j.completedCount() != 0 {
+		t.Fatal("transient failure must not fail, delete or complete the job")
+	}
+}
+
+func TestFinalAttemptFailsJobAndReleasesMessage(t *testing.T) {
+	q, j, p := newFakeQueue(body(1)), &fakeJobs{attempts: 3}, &fakeProc{err: errors.New("boom")}
+	cancel, result := startCfg(t, q, j, p, Config{Concurrency: 1, PollWait: time.Second, ShutdownTimeout: time.Second, MaxAttempts: 3})
+	waitFor(t, func() bool { return len(q.snapshot()) == 1 })
+	cancel()
+	<-result
+	if ev := q.snapshot(); len(ev) != 1 || ev[0] != "vis:0s" {
+		t.Fatalf("events = %v, want [vis:0s]", ev)
+	}
+	msg, failed := j.failedMsg("job-1")
+	if !failed || !strings.Contains(msg, "giving up after 3 attempts") || !strings.Contains(msg, "boom") {
+		t.Fatalf("failure message = %q (failed=%v)", msg, failed)
+	}
+}
+
+func TestFinalDeliveryUsesReceiveCount(t *testing.T) {
+	// The job was claimed twice, but the queue has delivered the message three times (one
+	// delivery was lost before it was claimed). This is the last delivery before redrive.
+	q, j, p := newFakeQueue(body(1)), &fakeJobs{attempts: 2}, &fakeProc{err: errors.New("boom")}
+	q.pending[0].ReceiveCount = 3
+	cancel, result := startCfg(t, q, j, p, Config{Concurrency: 1, PollWait: time.Second, ShutdownTimeout: time.Second, MaxAttempts: 3})
+	waitFor(t, func() bool { return len(q.snapshot()) == 1 })
+	cancel()
+	<-result
+	if ev := q.snapshot(); len(ev) != 1 || ev[0] != "vis:0s" {
+		t.Fatalf("events = %v, want [vis:0s]", ev)
+	}
+	if msg, failed := j.failedMsg("job-1"); !failed || !strings.Contains(msg, "giving up after 3 attempts") {
+		t.Fatalf("failure message = %q (failed=%v)", msg, failed)
+	}
+}
+
+func TestSuccessDeletesMessage(t *testing.T) {
+	q, j, p := newFakeQueue(body(1)), &fakeJobs{}, &fakeProc{}
+	cancel, result := start(t, q, j, p, 1)
+	waitFor(t, func() bool { return q.deletedCount() == 1 })
+	cancel()
+	<-result
+	if ev := q.snapshot(); len(ev) != 1 || ev[0] != "delete" {
+		t.Fatalf("events = %v, want [delete]", ev)
+	}
+}
+
+func TestHeartbeatRunsDuringProcessAndStopsBeforeDelete(t *testing.T) {
+	q, j, p := newFakeQueue(body(1)), &fakeJobs{}, &fakeProc{delay: 120 * time.Millisecond}
+	cancel, result := startCfg(t, q, j, p, Config{
+		Concurrency: 1, PollWait: time.Second, ShutdownTimeout: time.Second,
+		VisibilityTimeout: 42 * time.Second, HeartbeatInterval: 10 * time.Millisecond,
+	})
+	waitFor(t, func() bool { return q.deletedCount() == 1 })
+	time.Sleep(50 * time.Millisecond) // a leaked heartbeat would show up after the delete
+	cancel()
+	<-result
+	ev := q.snapshot()
+	if len(ev) < 3 || ev[len(ev)-1] != "delete" {
+		t.Fatalf("events = %v, want several heartbeats then delete last", ev)
+	}
+	for _, e := range ev[:len(ev)-1] {
+		if e != "vis:42s" {
+			t.Fatalf("unexpected event %q in %v", e, ev)
+		}
+	}
+}
+
+func TestShutdownCancelDoesNotFailJob(t *testing.T) {
+	q, j, p := newFakeQueue(body(1)), &fakeJobs{attempts: 3}, &fakeProc{delay: time.Minute, started: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	w := New(q, j, p, Config{Concurrency: 1, PollWait: time.Second, ShutdownTimeout: 50 * time.Millisecond, MaxAttempts: 3}, quiet())
+	res := make(chan error, 1)
+	go func() { res <- w.Run(ctx) }()
+	<-p.started
+	cancel()
+	<-res
+	if _, failed := j.failedMsg("job-1"); failed {
+		t.Fatal("shutdown cancellation must not mark the job FAILED")
+	}
+	if ev := q.snapshot(); len(ev) != 0 {
+		t.Fatalf("events = %v, want none", ev)
 	}
 }
 
@@ -242,6 +369,50 @@ func TestShutdownFinishesInFlightAndSkipsQueued(t *testing.T) {
 	}
 	if j.completedCount() != concurrency || q.deletedCount() != concurrency {
 		t.Fatalf("in-flight jobs did not finish cleanly: completed=%d deleted=%d", j.completedCount(), q.deletedCount())
+	}
+	if got := q.snapshot(); len(got) != concurrency {
+		t.Fatalf("events = %v, want only the %d deletes of in-flight jobs", got, concurrency)
+	}
+}
+
+// blockingQueue holds Receive open until unblock is closed, like a server-side long poll.
+type blockingQueue struct {
+	*fakeQueue
+	entered      chan struct{}
+	unblock      chan struct{}
+	ctxCancelled atomic.Bool
+}
+
+func (q *blockingQueue) Receive(ctx context.Context, _ int, _ time.Duration) ([]queue.Msg, error) {
+	close(q.entered)
+	<-q.unblock
+	q.ctxCancelled.Store(ctx.Err() != nil)
+	return []queue.Msg{{ID: "late", Body: body(9), Receipt: "late"}}, nil
+}
+
+func TestShutdownLetsReceiveFinishAndReleasesItsMessages(t *testing.T) {
+	q := &blockingQueue{fakeQueue: newFakeQueue(), entered: make(chan struct{}), unblock: make(chan struct{})}
+	j, p := &fakeJobs{}, &fakeProc{}
+	cancel, result := start(t, q, j, p, 2)
+	<-q.entered
+	cancel()
+	select {
+	case err := <-result:
+		t.Fatalf("Run returned (%v) while a receive was still in flight", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(q.unblock)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if q.ctxCancelled.Load() {
+		t.Fatal("shutdown cancelled the in-flight receive")
+	}
+	if ev := q.snapshot(); len(ev) != 1 || ev[0] != "vis:0s" {
+		t.Fatalf("events = %v, want [vis:0s]", ev)
+	}
+	if p.calls.Load() != 0 || j.completedCount() != 0 {
+		t.Fatal("a message received after shutdown began must not be processed")
 	}
 }
 
@@ -275,5 +446,37 @@ func TestInvalidInputFailsJobAndDeletesMessage(t *testing.T) {
 	}
 	if len(j.completed) != 0 {
 		t.Fatal("invalid input must not complete the job")
+	}
+}
+
+// shutdownOnReceive cancels the worker's context while delivering a batch, so every message in
+// it is received but not started when shutdown begins.
+type shutdownOnReceive struct {
+	*fakeQueue
+	cancel context.CancelFunc
+}
+
+func (q *shutdownOnReceive) Receive(ctx context.Context, limit int, wait time.Duration) ([]queue.Msg, error) {
+	batch, err := q.fakeQueue.Receive(ctx, limit, wait)
+	if len(batch) > 0 {
+		q.cancel()
+	}
+	return batch, err
+}
+
+func TestUnstartedMessagesAreReleasedAtShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	q := &shutdownOnReceive{fakeQueue: newFakeQueue(body(1), body(2), body(3)), cancel: cancel}
+	j, p := &fakeJobs{}, &fakeProc{}
+	w := New(q, j, p, Config{Concurrency: 3, PollWait: time.Second, ShutdownTimeout: time.Second}, quiet())
+	if err := w.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ev := q.snapshot()
+	if len(ev) != 3 || ev[0] != "vis:0s" || ev[1] != "vis:0s" || ev[2] != "vis:0s" {
+		t.Fatalf("events = %v, want three vis:0s", ev)
+	}
+	if p.calls.Load() != 0 || q.deletedCount() != 0 {
+		t.Fatal("unstarted messages must be neither processed nor deleted")
 	}
 }

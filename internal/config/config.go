@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -20,6 +21,7 @@ type Config struct {
 	WorkerConcurrency int
 	MaxUploadBytes    int64
 	MaxAttempts       int
+	FailRate          float64 // dev-only fault injection probability, 0..1
 }
 
 // Load reads settings once at startup. AWS credentials are left to the SDK's
@@ -56,6 +58,10 @@ func Load() (Config, error) {
 	c.MaxUploadBytes, err = strconv.ParseInt(value("MAX_UPLOAD_BYTES", "524288000"), 10, 64)
 	if err != nil || c.MaxUploadBytes <= 0 {
 		return Config{}, fmt.Errorf("MAX_UPLOAD_BYTES must be a positive integer")
+	}
+	c.FailRate, err = strconv.ParseFloat(value("FAIL_RATE", "0"), 64)
+	if err != nil || math.IsNaN(c.FailRate) || c.FailRate < 0 || c.FailRate > 1 {
+		return Config{}, fmt.Errorf("FAIL_RATE must be a number between 0 and 1")
 	}
 	return c, nil
 }
