@@ -84,6 +84,19 @@ A job has the fields `id`, `filename`, `status` (`PENDING`, `PROCESSING`, `COMPL
 `total_rows`, `valid_rows`, `invalid_rows`, `attempts`, `error_msg`, `created_at`, `updated_at`,
 `started_at` and `finished_at`.
 
+## Web UI
+
+With the stack up, `make run-api` and `make run-worker` running, open http://localhost:8080.
+The page is embedded in the API binary (plain HTML, CSS and JavaScript, no build step).
+
+- **Upload** - drag CSV files onto the drop zone or click it to choose them. Upload progress is
+  shown per file; non-`.csv` files are rejected and server errors are displayed.
+- **Generate sample** - downloads a 200-row CSV (`GET /api/sample.csv`) where one row in ten is
+  invalid, covering every validation rule. Drop it on the page to try the whole flow.
+- **Jobs table** - refreshes every 2 seconds (paused while the tab is hidden) with status,
+  row progress, attempts and duration. Completed jobs link to a **Summary** panel (totals,
+  rows/sec, errors by field and by rule) and to the `errors.csv` download.
+
 ## Worker
 
 `make run-worker` starts the queue consumer. It long-polls SQS and feeds a fixed pool of

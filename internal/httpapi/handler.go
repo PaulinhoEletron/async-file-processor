@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"time"
@@ -39,6 +40,8 @@ type Deps struct {
 	Queue          Queue
 	Logger         *slog.Logger
 	MaxUploadBytes int64
+	// UI holds the embedded web UI files (index.html, app.js, style.css). Nil disables the UI routes.
+	UI fs.FS
 }
 
 type api struct {
@@ -61,6 +64,8 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/jobs", a.listJobs)
 	mux.HandleFunc("GET /api/jobs/{id}/report", a.getReport)
 	mux.HandleFunc("GET /api/jobs/{id}/errors.csv", a.getErrorsCSV)
+	mux.HandleFunc("GET /api/sample.csv", a.getSampleCSV)
+	a.registerUI(mux)
 	return requestID(logRequests(d.Logger, recoverPanics(d.Logger, mux)))
 }
 

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Async File Processor</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap top-inner">
+      <h1>Async File Processor</h1>
+      <p class="sub">Upload a CSV. It is validated in the background and a report is generated.</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card">
+      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose CSV files to upload">
+        <strong>Drop CSV files here</strong>
+        <span>or click to choose</span>
+        <input id="file" type="file" accept=".csv,text/csv" multiple hidden>
+      </div>
+      <div class="actions">
+        <a id="sample" class="btn" href="/api/sample.csv" download="sample.csv">Generate sample</a>
+        <span class="hint">Downloads a 200-row CSV with deliberate errors. Drop it above to try the flow.</span>
+      </div>
+      <ul id="uploads" class="uploads" aria-live="polite"></ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Jobs</h2>
+        <span id="poll" class="hint"></span>
+      </div>
+      <div id="jobs-error" class="notice" hidden></div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>File</th><th>Status</th><th class="col-progress">Progress</th>
+              <th class="num">Attempts</th><th class="num">Duration</th><th>Links</th>
+            </tr>
+          </thead>
+          <tbody id="jobs"></tbody>
+        </table>
+      </div>
+      <p id="empty" class="empty" hidden>No jobs yet. Upload a file to get started.</p>
+    </section>
+  </main>
+
+  <div id="detail" class="overlay" hidden>
+    <div class="panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+      <div class="card-head">
+        <h2 id="detail-title">Summary</h2>
+        <button id="detail-close" class="btn ghost" type="button">Close</button>
+      </div>
+      <div id="detail-body"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

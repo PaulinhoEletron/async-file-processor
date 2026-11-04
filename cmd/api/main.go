@@ -17,6 +17,7 @@ import (
 	"async-file-processor/internal/queue"
 	"async-file-processor/internal/storage"
 	"async-file-processor/migrations"
+	"async-file-processor/web"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -69,7 +70,7 @@ func run(logger *slog.Logger) error {
 	server := &http.Server{
 		Addr: cfg.APIAddr,
 		Handler: httpapi.NewHandler(httpapi.Deps{
-			Store: store, Jobs: jobs.NewRepo(pool), Queue: jobQueue, Logger: logger, MaxUploadBytes: cfg.MaxUploadBytes,
+			Store: store, Jobs: jobs.NewRepo(pool), Queue: jobQueue, Logger: logger, MaxUploadBytes: cfg.MaxUploadBytes, UI: web.FS(),
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
