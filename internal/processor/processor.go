@@ -187,7 +187,7 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 		}
 		if res.Total%ProgressEvery == 0 {
 			if err := p.progress.UpdateProgress(ctx, job.ID, res.Total, res.Valid, res.Invalid); err != nil {
-				p.logger.Warn("update progress failed", "job_id", job.ID, "error", err)
+				p.logger.Warn("update progress failed", "job_id", job.ID, "attempt", job.Attempts, "error", err)
 			}
 		}
 	}

@@ -66,11 +66,13 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	repo := jobs.NewRepo(pool)
 	// No Read/WriteTimeout: large uploads stream for as long as the client needs.
 	server := &http.Server{
 		Addr: cfg.APIAddr,
 		Handler: httpapi.NewHandler(httpapi.Deps{
-			Store: store, Jobs: jobs.NewRepo(pool), Queue: jobQueue, Logger: logger, MaxUploadBytes: cfg.MaxUploadBytes, UI: web.FS(),
+			Store: store, Jobs: repo, Queue: jobQueue, Logger: logger, MaxUploadBytes: cfg.MaxUploadBytes, UI: web.FS(),
+			Checks: map[string]httpapi.Checker{"db": pool.Ping, "s3": store.Check, "sqs": jobQueue.Check},
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,

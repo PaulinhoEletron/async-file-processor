@@ -155,6 +155,18 @@ func (r *Repo) Fail(ctx context.Context, id, msg string) error {
 		 WHERE id = $1 AND status IN ('PENDING', 'PROCESSING')`, id, msg)
 }
 
+// FailIfActive marks a PENDING or PROCESSING job FAILED with msg. Jobs already finished (or
+// unknown) are left untouched. It reports whether a job was changed.
+func (r *Repo) FailIfActive(ctx context.Context, id, msg string) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE jobs SET status = 'FAILED', error_msg = $2, finished_at = now(), updated_at = now()
+		 WHERE id = $1 AND status IN ('PENDING', 'PROCESSING')`, id, msg)
+	if err != nil {
+		return false, fmt.Errorf("fail active job %s: %w", id, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // exec runs a single-row update and maps zero affected rows to ErrNotFound or ErrNotClaimable.
 func (r *Repo) exec(ctx context.Context, id, op, sql string, args ...any) error {
 	tag, err := r.pool.Exec(ctx, sql, args...)

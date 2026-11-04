@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -21,6 +22,13 @@ func TestLoad(t *testing.T) {
 	}
 	if cfg.FailRate != 0 {
 		t.Fatalf("FAIL_RATE default = %v, want 0", cfg.FailRate)
+	}
+	if cfg.MetricsAddr != ":9091" || !strings.HasSuffix(cfg.SQSDLQURL, "/jobs-dlq") {
+		t.Fatalf("unexpected metrics/DLQ defaults: %+v", cfg)
+	}
+	t.Setenv("SQS_DLQ_URL", "")
+	if cfg, err = Load(); err != nil || cfg.SQSDLQURL != "" {
+		t.Fatalf("empty SQS_DLQ_URL must disable the consumer: %q, %v", cfg.SQSDLQURL, err)
 	}
 	t.Setenv("API_ADDR", ":9090")
 	t.Setenv("WORKER_CONCURRENCY", "8")

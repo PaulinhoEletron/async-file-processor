@@ -22,7 +22,7 @@ curl -i http://localhost:8080/healthz
 
 Returns HTTP 200 with `{"status":"ok"}`. The API handles SIGINT and SIGTERM,
 allowing active requests up to `SHUTDOWN_TIMEOUT` to finish.
-The health endpoint checks the API process; a dependency readiness check is planned.
+`/healthz` only checks the API process; `/readyz` checks its dependencies (see Observability).
 
 `make up` starts Postgres, MinIO, and ElasticMQ and waits for their health checks.
 ElasticMQ creates `jobs` and `jobs-dlq`, with redrive after three receives.
@@ -39,10 +39,11 @@ pinned by digest, because the original MinIO Docker Hub and Quay images no longe
 | MinIO console | http://localhost:9001 |
 | ElasticMQ SQS | http://localhost:9324 |
 | ElasticMQ statistics | http://localhost:9325 |
+| Worker metrics | http://localhost:9091 |
 
 ## API
 
-Errors are JSON: `{"error":"message"}`. Every response carries an `X-Request-ID` header
+Errors are JSON: `{"error":"message"}`, including unknown paths (`404`) and wrong methods (`405`). Every response carries an `X-Request-ID` header
 (a client-supplied value is echoed if it is short and alphanumeric).
 
 **Upload a CSV** - `POST /api/jobs`, multipart field `file`. The file is streamed to S3 without
@@ -129,7 +130,13 @@ again. The worker does not run migrations: start the API once first.
   `MAX_ATTEMPTS` (default 3) the job is marked `FAILED` with `giving up after N attempts: ...`
   and the message is released without being deleted. The queue's redrive policy then moves it
   to the dead-letter queue (`jobs-dlq`) instead of delivering it again. `MAX_ATTEMPTS` must
-  equal the queue's `maxReceiveCount` (`deploy/elasticmq.conf`).
+  equal the queue's `maxReceiveCount` (`deploy/elasticmq.conf`); the worker logs a warning at
+  startup if they differ.
+- **Dead-letter queue:** the worker also consumes `SQS_DLQ_URL` (empty disables it). For each
+  dead-lettered message it marks the job `FAILED` (`moved to dead-letter queue after N receives`)
+  unless the job already finished, then deletes the message. This covers a worker killed on the
+  final attempt, which would otherwise leave the job `PROCESSING` forever. Messages are consumed
+  and recorded on the job, not kept for manual replay.
 - **Heartbeat:** while a file is processed the worker extends the message's visibility every
   20s, so a large file is not redelivered to another worker. If the worker dies, the message
   becomes visible after the visibility timeout (60s) and another worker takes the job over.
@@ -138,6 +145,33 @@ again. The worker does not run migrations: start the API once first.
 - **Fault injection (development only):** `FAIL_RATE=0.3 make run-worker` makes the worker fail
   30% of attempts with an injected transient error, which demonstrates retries (`attempts` above
   1 in the job status) and, occasionally, a job exhausted into the dead-letter queue.
+
+## Observability
+
+Logs are JSON on stdout. API request lines carry `request_id`; worker and processor lines about
+a job carry `job_id` and `attempt`.
+
+| Endpoint | Where | Meaning |
+| --- | --- | --- |
+| `GET /healthz` | API `:8080`, worker `:9091` | Liveness: the process is up. |
+| `GET /readyz` | API `:8080` | Readiness: checks Postgres, the S3 bucket and the SQS queue (2s each, in parallel). `200` with `{"status":"ready","checks":{...}}`, or `503` with the error of each failing check. |
+| `GET /metrics` | API `:8080`, worker `:9091` (`METRICS_ADDR`) | Prometheus metrics. |
+
+Metrics (plus Go runtime and process metrics):
+
+| Metric | Type | Source |
+| --- | --- | --- |
+| `jobs_total{status}` | counter | `created` by the API on upload; `completed` and `failed` by the worker |
+| `rows_processed_total` | counter | worker; rows of completed jobs |
+| `job_duration_seconds` | histogram | worker; one observation per finished attempt |
+| `worker_busy` | gauge | worker; jobs being processed right now |
+| `upload_bytes_total` | counter | API; bytes accepted by `POST /api/jobs` |
+| `jobs_dead_lettered_total` | counter | worker; dead-letter messages consumed |
+
+```sh
+curl http://localhost:8080/readyz
+curl -s http://localhost:9091/metrics | grep -E 'jobs_total|worker_busy'
+```
 
 ## CSV validation
 
@@ -232,9 +266,19 @@ AWS credentials use the standard `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
 Postgres uses host port 5433 to coexist with a local installation. If you change
 `POSTGRES_PORT`, update the port in `DATABASE_URL` to match.
 
+## Testing
+
 ```sh
-make test
+make test               # unit tests with the race detector
 make test-integration   # needs `make up`; exercises Postgres, S3, and SQS
+make e2e                # starts the stack, the API and the worker, then uploads and checks results
+```
+
+`make e2e` uploads the generated sample (200 rows, 20 invalid) and a file with a bad header,
+polls until the jobs finish, and asserts the counts, `errors.csv`, the report and the metrics.
+It needs ports 8080 and 9091 free and stops the processes it starts.
+
+```sh
 make lint
 make run-worker
 make down

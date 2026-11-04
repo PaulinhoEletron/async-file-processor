@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"async-file-processor/internal/jobs"
+	"async-file-processor/internal/metrics"
 
 	"github.com/google/uuid"
 )
@@ -51,10 +52,12 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 
 	id := uuid.NewString()
 	key := id + "/input.csv"
-	if err := a.Store.Put(r.Context(), key, part); err != nil {
+	counted := &countingReader{r: part}
+	if err := a.Store.Put(r.Context(), key, counted); err != nil {
 		a.uploadError(w, r, err, "store upload")
 		return
 	}
+	a.Metrics.UploadBytes.Add(float64(counted.n))
 
 	// Persist and enqueue with a context that survives a client disconnect, so a stored
 	// object is not left without a job record.
@@ -78,7 +81,8 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "could not queue job for processing")
 		return
 	}
-	log.Info("job created", "job_id", id, "filename", filename)
+	a.Metrics.JobsTotal.WithLabelValues(metrics.StatusCreated).Inc()
+	log.Info("job created", "job_id", id, "filename", filename, "bytes", counted.n)
 	writeJSON(w, http.StatusAccepted, newJobResponse(job))
 }
 
@@ -158,4 +162,17 @@ func (a *api) listJobs(w http.ResponseWriter, r *http.Request) {
 		out = append(out, newJobResponse(j))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// countingReader counts the bytes read through it. The upload reads it from a single goroutine
+// at a time and the count is read only after Put returns.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }

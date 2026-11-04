@@ -67,6 +67,14 @@ func (s *Store) EnsureBucket(ctx context.Context) error {
 	return nil
 }
 
+// Check verifies that the bucket is reachable.
+func (s *Store) Check(ctx context.Context) error {
+	if _, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &s.bucket}); err != nil {
+		return fmt.Errorf("head bucket %q: %w", s.bucket, err)
+	}
+	return nil
+}
+
 // Put streams r to key using multipart upload without buffering the whole body.
 func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
 	_, err := s.uploader.Upload(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: r})

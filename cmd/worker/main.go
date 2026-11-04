@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,6 +13,7 @@ import (
 
 	"async-file-processor/internal/config"
 	"async-file-processor/internal/jobs"
+	"async-file-processor/internal/metrics"
 	"async-file-processor/internal/processor"
 	"async-file-processor/internal/queue"
 	"async-file-processor/internal/storage"
@@ -62,6 +65,9 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	warnOnAttemptMismatch(startCtx, logger, jobQueue, cfg.MaxAttempts)
+
+	m := metrics.New()
 	repo := jobs.NewRepo(pool)
 	var proc worker.Processor = processor.New(store, repo, logger)
 	if cfg.FailRate > 0 {
@@ -76,11 +82,85 @@ func run(logger *slog.Logger) error {
 		// Matches the jobs queue's defaultVisibilityTimeout in deploy/elasticmq.conf.
 		VisibilityTimeout: 60 * time.Second,
 		HeartbeatInterval: heartbeatInterval,
+		Metrics:           m,
 	}, logger)
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m.Handler())
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	metricsErrors := make(chan error, 1)
+	go func() {
+		logger.Info("metrics listening", "addr", cfg.MetricsAddr)
+		metricsErrors <- metricsServer.ListenAndServe()
+	}()
+	// The metrics server stays up while in-flight jobs drain.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			_ = metricsServer.Close()
+		}
+	}()
+
+	// runCtx also ends if the metrics server cannot run, so a port clash is not silent.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	var metricsErr error
+	metricsStopped := make(chan struct{})
+	go func() {
+		defer close(metricsStopped)
+		if err := <-metricsErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			metricsErr = err
+			cancelRun()
+		}
+	}()
+
+	var dlqDone chan struct{}
+	if cfg.SQSDLQURL != "" {
+		dlq, err := queue.New(startCtx, queue.Config{Region: cfg.AWSRegion, Endpoint: cfg.SQSEndpoint, QueueURL: cfg.SQSDLQURL})
+		if err != nil {
+			return err
+		}
+		consumer := worker.NewDLQConsumer(dlq, repo, m, cfg.MaxAttempts, queue.MaxWait, logger)
+		dlqDone = make(chan struct{})
+		go func() { defer close(dlqDone); consumer.Run(runCtx) }()
+	} else {
+		logger.Warn("SQS_DLQ_URL is empty; dead-lettered jobs will not be failed automatically")
+	}
+
 	logger.Info("worker started", "concurrency", cfg.WorkerConcurrency)
-	if err := w.Run(ctx); err != nil {
+	err = w.Run(runCtx)
+	cancelRun()
+	if dlqDone != nil {
+		<-dlqDone
+	}
+	if err != nil {
 		return err
+	}
+	select {
+	case <-metricsStopped:
+		if metricsErr != nil {
+			return fmt.Errorf("metrics server: %w", metricsErr)
+		}
+	default:
 	}
 	logger.Info("worker stopped")
 	return nil
+}
+
+// warnOnAttemptMismatch logs a warning when MAX_ATTEMPTS differs from the jobs queue's
+// maxReceiveCount, since exhausted jobs would then not reach the dead-letter queue as intended.
+func warnOnAttemptMismatch(ctx context.Context, logger *slog.Logger, q *queue.Queue, maxAttempts int) {
+	n, err := q.MaxReceiveCount(ctx)
+	switch {
+	case err != nil:
+		logger.Warn("could not read queue redrive policy", "error", err)
+	case n != maxAttempts:
+		logger.Warn("MAX_ATTEMPTS does not match the queue's maxReceiveCount",
+			"max_attempts", maxAttempts, "max_receive_count", n)
+	}
 }

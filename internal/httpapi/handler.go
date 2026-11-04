@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"async-file-processor/internal/jobs"
+	"async-file-processor/internal/metrics"
 )
 
 // Store reads and writes objects.
@@ -33,6 +34,9 @@ type Queue interface {
 	Send(ctx context.Context, body string) error
 }
 
+// Checker probes one dependency for /readyz and returns an error when it is unavailable.
+type Checker func(ctx context.Context) error
+
 // Deps are the collaborators and settings the handler needs.
 type Deps struct {
 	Store          Store
@@ -42,6 +46,10 @@ type Deps struct {
 	MaxUploadBytes int64
 	// UI holds the embedded web UI files (index.html, app.js, style.css). Nil disables the UI routes.
 	UI fs.FS
+	// Checks are the dependency probes behind /readyz, keyed by name (for example "db").
+	Checks map[string]Checker
+	// Metrics receives upload and job counters and is served at /metrics. Nil uses a private set.
+	Metrics *metrics.Metrics
 }
 
 type api struct {
@@ -53,12 +61,17 @@ func NewHandler(d Deps) http.Handler {
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
 	}
+	if d.Metrics == nil {
+		d.Metrics = metrics.New()
+	}
 	a := &api{d}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("GET /readyz", a.readyz)
+	mux.Handle("GET /metrics", d.Metrics.Handler())
 	mux.HandleFunc("POST /api/jobs", a.createJob)
 	mux.HandleFunc("GET /api/jobs/{id}", a.getJob)
 	mux.HandleFunc("GET /api/jobs", a.listJobs)
@@ -66,7 +79,7 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/jobs/{id}/errors.csv", a.getErrorsCSV)
 	mux.HandleFunc("GET /api/sample.csv", a.getSampleCSV)
 	a.registerUI(mux)
-	return requestID(logRequests(d.Logger, recoverPanics(d.Logger, mux)))
+	return requestID(logRequests(d.Logger, recoverPanics(d.Logger, jsonErrors(mux))))
 }
 
 // jobResponse is the public JSON form of a job. Internal object keys are not exposed.

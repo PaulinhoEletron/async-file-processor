@@ -3,6 +3,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -101,4 +102,43 @@ func (q *Queue) ChangeVisibility(ctx context.Context, receipt string, timeout ti
 		return fmt.Errorf("change message visibility: %w", err)
 	}
 	return nil
+}
+
+// Check verifies that the queue is reachable.
+func (q *Queue) Check(ctx context.Context) error {
+	_, err := q.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl:       &q.url,
+		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameQueueArn},
+	})
+	if err != nil {
+		return fmt.Errorf("get queue attributes: %w", err)
+	}
+	return nil
+}
+
+// MaxReceiveCount returns the maxReceiveCount of the queue's redrive policy, or 0 when the
+// queue has no dead-letter queue.
+func (q *Queue) MaxReceiveCount(ctx context.Context) (int, error) {
+	out, err := q.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl:       &q.url,
+		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameRedrivePolicy},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("get queue attributes: %w", err)
+	}
+	raw := out.Attributes[string(sqstypes.QueueAttributeNameRedrivePolicy)]
+	if raw == "" {
+		return 0, nil
+	}
+	var policy struct {
+		MaxReceiveCount json.Number `json:"maxReceiveCount"`
+	}
+	if err := json.Unmarshal([]byte(raw), &policy); err != nil {
+		return 0, fmt.Errorf("parse redrive policy: %w", err)
+	}
+	n, err := policy.MaxReceiveCount.Int64()
+	if err != nil {
+		return 0, fmt.Errorf("parse maxReceiveCount: %w", err)
+	}
+	return int(n), nil
 }

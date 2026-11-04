@@ -13,8 +13,11 @@ import (
 	"time"
 
 	"async-file-processor/internal/jobs"
+	"async-file-processor/internal/metrics"
 	"async-file-processor/internal/processor"
 	"async-file-processor/internal/queue"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fakeQueue struct {
@@ -478,5 +481,56 @@ func TestUnstartedMessagesAreReleasedAtShutdown(t *testing.T) {
 	}
 	if p.calls.Load() != 0 || q.deletedCount() != 0 {
 		t.Fatal("unstarted messages must be neither processed nor deleted")
+	}
+}
+
+func TestMetricsTrackJobOutcomes(t *testing.T) {
+	m := metrics.New()
+	q := newFakeQueue(body(1), body(2))
+	j := &fakeJobs{}
+	p := &fakeProc{delay: 80 * time.Millisecond, started: make(chan struct{}, 4)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := New(q, j, p, Config{Concurrency: 2, PollWait: time.Second, ShutdownTimeout: 2 * time.Second, Metrics: m}, quiet())
+	res := make(chan error, 1)
+	go func() { res <- w.Run(ctx) }()
+
+	<-p.started
+	waitFor(t, func() bool { return testutil.ToFloat64(m.WorkerBusy) >= 1 })
+	waitFor(t, func() bool { return q.deletedCount() == 2 })
+	waitFor(t, func() bool { return testutil.ToFloat64(m.WorkerBusy) == 0 })
+	cancel()
+	if err := <-res; err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(m.JobsTotal.WithLabelValues(metrics.StatusCompleted)); got != 2 {
+		t.Fatalf("jobs_total{completed} = %v, want 2", got)
+	}
+	if got := testutil.CollectAndCount(m.JobDuration); got != 1 {
+		t.Fatalf("job_duration_seconds series = %d", got)
+	}
+}
+
+func TestMetricsCountFailedJobs(t *testing.T) {
+	m := metrics.New()
+	// Permanent failure.
+	q := newFakeQueue(body(1))
+	p := &fakeProc{err: fmt.Errorf("bad header: %w", processor.ErrInvalidInput)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := New(q, &fakeJobs{}, p, Config{Concurrency: 1, PollWait: time.Second, ShutdownTimeout: 2 * time.Second, Metrics: m}, quiet())
+	res := make(chan error, 1)
+	go func() { res <- w.Run(ctx) }()
+	waitFor(t, func() bool { return q.deletedCount() == 1 })
+	cancel()
+	<-res
+	if got := testutil.ToFloat64(m.JobsTotal.WithLabelValues(metrics.StatusFailed)); got != 1 {
+		t.Fatalf("jobs_total{failed} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.JobsTotal.WithLabelValues(metrics.StatusCompleted)); got != 0 {
+		t.Fatalf("jobs_total{completed} = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(m.WorkerBusy); got != 0 {
+		t.Fatalf("worker_busy = %v, want 0", got)
 	}
 }

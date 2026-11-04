@@ -119,6 +119,39 @@ func TestQueue(t *testing.T) {
 	}
 }
 
+func TestChecks(t *testing.T) {
+	cfg := loadConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.New(ctx, storage.Config{Region: cfg.AWSRegion, Endpoint: cfg.S3Endpoint, Bucket: cfg.S3Bucket})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureBucket(ctx); err != nil {
+		t.Fatalf("object storage unavailable (run make up): %v", err)
+	}
+	if err := store.Check(ctx); err != nil {
+		t.Fatalf("storage check: %v", err)
+	}
+	q, err := queue.New(ctx, queue.Config{Region: cfg.AWSRegion, Endpoint: cfg.SQSEndpoint, QueueURL: cfg.SQSQueueURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Check(ctx); err != nil {
+		t.Fatalf("queue check (run make up): %v", err)
+	}
+	if n, err := q.MaxReceiveCount(ctx); err != nil || n != cfg.MaxAttempts {
+		t.Fatalf("MaxReceiveCount = %d, %v; want %d", n, err, cfg.MaxAttempts)
+	}
+	missing, err := queue.New(ctx, queue.Config{Region: cfg.AWSRegion, Endpoint: cfg.SQSEndpoint, QueueURL: cfg.SQSEndpoint + "/000000000000/no-such-queue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := missing.Check(ctx); err == nil {
+		t.Fatal("expected an error for a missing queue")
+	}
+}
+
 func TestJobs(t *testing.T) {
 	cfg := loadConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -199,6 +232,39 @@ func TestJobs(t *testing.T) {
 		}
 		if _, err := repo.MarkProcessing(ctx, id); !errors.Is(err, jobs.ErrNotClaimable) {
 			t.Fatalf("MarkProcessing on COMPLETED: %v, want ErrNotClaimable", err)
+		}
+	})
+
+	t.Run("fail if active", func(t *testing.T) {
+		stuck := newJob(t)
+		if _, err := repo.MarkProcessing(ctx, stuck); err != nil {
+			t.Fatal(err)
+		}
+		changed, err := repo.FailIfActive(ctx, stuck, "moved to dead-letter queue after 3 receives")
+		if err != nil || !changed {
+			t.Fatalf("FailIfActive on PROCESSING = %v, %v", changed, err)
+		}
+		got, err := repo.Get(ctx, stuck)
+		if err != nil || got.Status != jobs.StatusFailed || got.FinishedAt == nil ||
+			got.ErrorMsg == nil || *got.ErrorMsg != "moved to dead-letter queue after 3 receives" {
+			t.Fatalf("unexpected job after FailIfActive: %+v, %v", got, err)
+		}
+		// Finished jobs and unknown ids are left alone.
+		if changed, err := repo.FailIfActive(ctx, stuck, "again"); err != nil || changed {
+			t.Fatalf("FailIfActive on FAILED = %v, %v", changed, err)
+		}
+		done := newJob(t)
+		if err := repo.Complete(ctx, done, "", "", 1, 1, 0); err != nil {
+			t.Fatal(err)
+		}
+		if changed, err := repo.FailIfActive(ctx, done, "x"); err != nil || changed {
+			t.Fatalf("FailIfActive on COMPLETED = %v, %v", changed, err)
+		}
+		if got, _ := repo.Get(ctx, done); got.Status != jobs.StatusCompleted {
+			t.Fatalf("COMPLETED job was modified: %+v", got)
+		}
+		if changed, err := repo.FailIfActive(ctx, uuid.NewString(), "x"); err != nil || changed {
+			t.Fatalf("FailIfActive on unknown id = %v, %v", changed, err)
 		}
 	})
 

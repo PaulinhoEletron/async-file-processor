@@ -18,6 +18,8 @@ type Config struct {
 	S3Bucket          string
 	SQSEndpoint       string
 	SQSQueueURL       string
+	SQSDLQURL         string // dead-letter queue consumed by the worker; empty disables the consumer
+	MetricsAddr       string // worker metrics listen address
 	WorkerConcurrency int
 	MaxUploadBytes    int64
 	MaxAttempts       int
@@ -35,6 +37,11 @@ func Load() (Config, error) {
 		S3Bucket:    value("S3_BUCKET", "uploads"),
 		SQSEndpoint: value("SQS_ENDPOINT", "http://localhost:9324"),
 		SQSQueueURL: value("SQS_QUEUE_URL", "http://localhost:9324/000000000000/jobs"),
+	}
+	c.MetricsAddr = value("METRICS_ADDR", ":9091")
+	c.SQSDLQURL = "http://localhost:9324/000000000000/jobs-dlq"
+	if v, ok := os.LookupEnv("SQS_DLQ_URL"); ok {
+		c.SQSDLQURL = v // set but empty disables the consumer
 	}
 	var err error
 	c.ShutdownTimeout, err = time.ParseDuration(value("SHUTDOWN_TIMEOUT", "15s"))

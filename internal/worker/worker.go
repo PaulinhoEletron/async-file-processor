@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"async-file-processor/internal/jobs"
+	"async-file-processor/internal/metrics"
 	"async-file-processor/internal/processor"
 	"async-file-processor/internal/queue"
 )
@@ -69,6 +70,9 @@ type Config struct {
 	MaxAttempts       int
 	VisibilityTimeout time.Duration // visibility the heartbeat keeps extending while a job runs
 	HeartbeatInterval time.Duration // how often the heartbeat extends visibility
+
+	// Metrics receives job counters and gauges. Nil uses a private, unexposed set.
+	Metrics *metrics.Metrics
 }
 
 // Worker receives messages and dispatches them to a bounded pool.
@@ -78,6 +82,7 @@ type Worker struct {
 	proc   Processor
 	cfg    Config
 	logger *slog.Logger
+	m      *metrics.Metrics
 }
 
 // New returns a Worker. Concurrency below 1 is treated as 1.
@@ -92,7 +97,10 @@ func New(q Queue, j Jobs, p Processor, cfg Config, logger *slog.Logger) *Worker 
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = defaultHeartbeat
 	}
-	return &Worker{queue: q, jobs: j, proc: p, cfg: cfg, logger: logger}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.New()
+	}
+	return &Worker{queue: q, jobs: j, proc: p, cfg: cfg, logger: logger, m: cfg.Metrics}
 }
 
 // Run consumes messages until ctx is cancelled, then waits up to ShutdownTimeout for in-flight
@@ -229,9 +237,11 @@ func (w *Worker) handle(ctx context.Context, workerID int, m queue.Msg) {
 		return
 	}
 
+	log = log.With("attempt", job.Attempts)
 	start := time.Now()
-	log.Info("job started", "filename", job.Filename, "attempt", job.Attempts)
+	log.Info("job started", "filename", job.Filename)
 
+	w.m.WorkerBusy.Inc()
 	stopBeat := w.heartbeat(ctx, log, m.Receipt)
 	res, err := w.proc.Process(ctx, job)
 	if err == nil {
@@ -240,12 +250,19 @@ func (w *Worker) handle(ctx context.Context, workerID int, m queue.Msg) {
 	// The heartbeat must be gone before the message is deleted or its visibility is changed, so
 	// it can never overwrite a backoff.
 	stopBeat()
-	duration := time.Since(start).String()
+	w.m.WorkerBusy.Dec()
+	elapsed := time.Since(start)
+	duration := elapsed.String()
+	if ctx.Err() == nil { // an attempt cut off by shutdown has no outcome to time
+		w.m.JobDuration.Observe(elapsed.Seconds())
+	}
 
 	switch {
 	case err == nil:
 		log.Info("job completed", "duration", duration,
 			"total_rows", res.Total, "valid_rows", res.Valid, "invalid_rows", res.Invalid)
+		w.m.JobsTotal.WithLabelValues(metrics.StatusCompleted).Inc()
+		w.m.RowsProcessed.Add(float64(res.Total))
 		w.delete(ctx, workerID, m, p.JobID)
 	case ctx.Err() != nil:
 		// Shutdown is not a failure: leave the message to become visible again.
@@ -257,6 +274,7 @@ func (w *Worker) handle(ctx context.Context, workerID int, m queue.Msg) {
 			return
 		}
 		log.Warn("job failed: invalid input", "error", err, "duration", duration)
+		w.m.JobsTotal.WithLabelValues(metrics.StatusFailed).Inc()
 		w.delete(ctx, workerID, m, p.JobID)
 	default:
 		w.handleTransient(ctx, log, m, job, err, duration)
@@ -277,7 +295,8 @@ func (w *Worker) handleTransient(ctx context.Context, log *slog.Logger, m queue.
 			log.Error("mark job failed; leaving message for redelivery", "error", failErr)
 			return
 		}
-		log.Error("job failed: attempts exhausted", "attempt", attempt, "error", err, "duration", duration)
+		log.Error("job failed: attempts exhausted", "receive_count", m.ReceiveCount, "error", err, "duration", duration)
+		w.m.JobsTotal.WithLabelValues(metrics.StatusFailed).Inc()
 		// Make the message visible right away without deleting it: the queue's redrive policy
 		// moves it to the dead-letter queue on the next receive.
 		if vErr := w.queue.ChangeVisibility(ctx, m.Receipt, 0); vErr != nil {
@@ -287,7 +306,7 @@ func (w *Worker) handleTransient(ctx context.Context, log *slog.Logger, m queue.
 	}
 	delay := backoff(attempt)
 	log.Warn("job attempt failed; retrying after backoff",
-		"attempt", attempt, "backoff", delay.String(), "error", err, "duration", duration)
+		"receive_count", m.ReceiveCount, "backoff", delay.String(), "error", err, "duration", duration)
 	if vErr := w.queue.ChangeVisibility(ctx, m.Receipt, delay); vErr != nil {
 		log.Error("set retry backoff failed", "error", vErr)
 	}
