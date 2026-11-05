@@ -1,0 +1,14 @@
+# Development override: publishes the infrastructure ports on loopback so the Go binaries,
+# integration tests and tools can run on the host. Use through `make infra`.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+  minio:
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+  elasticmq:
+    ports:
+      - "127.0.0.1:9324:9324"
+      - "127.0.0.1:9325:9325"

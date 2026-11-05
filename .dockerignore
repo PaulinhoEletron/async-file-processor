@@ -1,0 +1,14 @@
+.git
+.env
+.claude
+bin
+coverage.out
+*.csv
+!scripts/sample.csv
+PLAN.md
+AGENTS.md
+CLAUDE.md
+reviews
+README.md
+Dockerfile
+docker-compose*.yml

@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoad(t *testing.T) {
@@ -10,6 +11,7 @@ func TestLoad(t *testing.T) {
 		"API_ADDR", "SHUTDOWN_TIMEOUT", "DATABASE_URL", "AWS_REGION",
 		"S3_ENDPOINT", "S3_BUCKET", "SQS_ENDPOINT", "SQS_QUEUE_URL",
 		"WORKER_CONCURRENCY", "MAX_UPLOAD_BYTES", "MAX_ATTEMPTS", "FAIL_RATE",
+		"UPLOAD_RATE_PER_MIN", "UPLOAD_RATE_BURST", "RETENTION", "RETENTION_INTERVAL",
 	} {
 		t.Setenv(key, "")
 	}
@@ -25,6 +27,9 @@ func TestLoad(t *testing.T) {
 	}
 	if cfg.MetricsAddr != ":9091" || !strings.HasSuffix(cfg.SQSDLQURL, "/jobs-dlq") {
 		t.Fatalf("unexpected metrics/DLQ defaults: %+v", cfg)
+	}
+	if cfg.UploadRatePerMin != 10 || cfg.UploadRateBurst != 5 || cfg.Retention != 24*time.Hour || cfg.RetentionInterval != 10*time.Minute {
+		t.Fatalf("unexpected limit/retention defaults: %+v", cfg)
 	}
 	t.Setenv("SQS_DLQ_URL", "")
 	if cfg, err = Load(); err != nil || cfg.SQSDLQURL != "" {
@@ -50,6 +55,12 @@ func TestLoad(t *testing.T) {
 		{"FAIL_RATE", "1.5"},
 		{"FAIL_RATE", "-0.1"},
 		{"FAIL_RATE", "abc"},
+		{"UPLOAD_RATE_PER_MIN", "-1"},
+		{"UPLOAD_RATE_PER_MIN", "fast"},
+		{"UPLOAD_RATE_BURST", "0"},
+		{"RETENTION", "-1h"},
+		{"RETENTION", "soon"},
+		{"RETENTION_INTERVAL", "0s"},
 	} {
 		t.Run(tc.key+"/"+tc.value, func(t *testing.T) {
 			t.Setenv(tc.key, tc.value)

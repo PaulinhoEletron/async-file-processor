@@ -182,6 +182,47 @@ func TestJobs(t *testing.T) {
 		return id
 	}
 
+	t.Run("expired jobs", func(t *testing.T) {
+		done, failed, active := newJob(t), newJob(t), newJob(t)
+		if err := repo.Complete(ctx, done, "", "", 1, 1, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Fail(ctx, failed, "boom"); err != nil {
+			t.Fatal(err)
+		}
+		contains := func(list []jobs.Job, id string) bool {
+			for _, j := range list {
+				if j.ID == id {
+					return true
+				}
+			}
+			return false
+		}
+		list, err := repo.ListExpired(ctx, time.Now().Add(-time.Hour), 1000)
+		if err != nil || contains(list, done) || contains(list, failed) {
+			t.Fatalf("recent jobs listed as expired: %v", err)
+		}
+		list, err = repo.ListExpired(ctx, time.Now().Add(time.Minute), 1000)
+		if err != nil || !contains(list, done) || !contains(list, failed) {
+			t.Fatalf("finished jobs missing from expired list: %v", err)
+		}
+		if contains(list, active) {
+			t.Fatal("a PENDING job must never be expired")
+		}
+		if ok, err := repo.DeleteFinished(ctx, active); err != nil || ok {
+			t.Fatalf("DeleteFinished(active) = %v, %v; want false, nil", ok, err)
+		}
+		if ok, err := repo.DeleteFinished(ctx, done); err != nil || !ok {
+			t.Fatalf("DeleteFinished(done) = %v, %v", ok, err)
+		}
+		if ok, err := repo.DeleteFinished(ctx, done); err != nil || ok {
+			t.Fatalf("second DeleteFinished = %v, %v; want false, nil", ok, err)
+		}
+		if _, err := repo.Get(ctx, done); !errors.Is(err, jobs.ErrNotFound) {
+			t.Fatalf("deleted job still present: %v", err)
+		}
+	})
+
 	t.Run("get and list", func(t *testing.T) {
 		id := newJob(t)
 		got, err := repo.Get(ctx, id)

@@ -98,3 +98,20 @@ func TestSampleCSV(t *testing.T) {
 		}
 	}
 }
+
+func TestSecurityHeaders(t *testing.T) {
+	h := newUIEnv()
+	for _, path := range []string{"/", "/app.js", "/api/jobs", "/nope"} {
+		rec := do(h, httptest.NewRequest(http.MethodGet, path, nil))
+		for name, want := range map[string]string{
+			"Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+			"X-Content-Type-Options":  "nosniff",
+			"X-Frame-Options":         "DENY",
+			"Referrer-Policy":         "no-referrer",
+		} {
+			if got := rec.Header().Get(name); got != want {
+				t.Errorf("%s %s = %q, want %q", path, name, got, want)
+			}
+		}
+	}
+}

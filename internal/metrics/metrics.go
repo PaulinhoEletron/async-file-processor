@@ -26,6 +26,7 @@ type Metrics struct {
 	WorkerBusy       prometheus.Gauge       // worker_busy
 	UploadBytes      prometheus.Counter     // upload_bytes_total
 	JobsDeadLettered prometheus.Counter     // jobs_dead_lettered_total
+	JobsExpired      prometheus.Counter     // jobs_expired_total
 }
 
 // New creates the collectors, registers them with the Go runtime and process collectors, and
@@ -53,11 +54,14 @@ func New() *Metrics {
 		JobsDeadLettered: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "jobs_dead_lettered_total", Help: "Messages consumed from the dead-letter queue.",
 		}),
+		JobsExpired: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "jobs_expired_total", Help: "Finished jobs deleted by the retention sweep.",
+		}),
 	}
 	m.Registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		m.JobsTotal, m.RowsProcessed, m.JobDuration, m.WorkerBusy, m.UploadBytes, m.JobsDeadLettered,
+		m.JobsTotal, m.RowsProcessed, m.JobDuration, m.WorkerBusy, m.UploadBytes, m.JobsDeadLettered, m.JobsExpired,
 	)
 	for _, s := range []string{StatusCreated, StatusCompleted, StatusFailed} {
 		m.JobsTotal.WithLabelValues(s)

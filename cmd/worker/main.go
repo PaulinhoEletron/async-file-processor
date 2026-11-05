@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"async-file-processor/internal/config"
+	"async-file-processor/internal/healthcheck"
 	"async-file-processor/internal/jobs"
 	"async-file-processor/internal/metrics"
 	"async-file-processor/internal/processor"
@@ -26,11 +28,29 @@ import (
 const heartbeatInterval = 20 * time.Second
 
 func main() {
+	probe := flag.Bool("healthcheck", false, "probe the local /healthz endpoint and exit 0 if healthy (for container health checks)")
+	flag.Parse()
+	if *probe {
+		os.Exit(runHealthcheck())
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
 		logger.Error("worker stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func runHealthcheck() int {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := healthcheck.Probe(healthcheck.URL(cfg.MetricsAddr, "/healthz"), 3*time.Second); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
 }
 
 // run expects the database schema to exist; the API applies migrations when it starts.
@@ -132,11 +152,23 @@ func run(logger *slog.Logger) error {
 		logger.Warn("SQS_DLQ_URL is empty; dead-lettered jobs will not be failed automatically")
 	}
 
+	var sweepDone chan struct{}
+	if cfg.Retention > 0 {
+		sweeper := worker.NewSweeper(repo, store, cfg.Retention, cfg.RetentionInterval, m, logger)
+		sweepDone = make(chan struct{})
+		go func() { defer close(sweepDone); sweeper.Run(runCtx) }()
+	} else {
+		logger.Info("RETENTION is 0; finished jobs are kept forever")
+	}
+
 	logger.Info("worker started", "concurrency", cfg.WorkerConcurrency)
 	err = w.Run(runCtx)
 	cancelRun()
 	if dlqDone != nil {
 		<-dlqDone
+	}
+	if sweepDone != nil {
+		<-sweepDone
 	}
 	if err != nil {
 		return err

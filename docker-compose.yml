@@ -1,12 +1,27 @@
+# Full stack: Postgres, MinIO, ElasticMQ, the API and two workers.
+# Only the API is published, and only on loopback. docker-compose.dev.yml adds the
+# infrastructure ports for running the Go binaries on the host (see `make infra`).
+x-app-env: &app-env
+  DATABASE_URL: postgres://processor:processor@postgres:5432/processor?sslmode=disable
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-local-access-key}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-local-secret-key}
+  S3_ENDPOINT: http://minio:9000
+  S3_BUCKET: uploads
+  SQS_ENDPOINT: http://elasticmq:9324
+  SQS_QUEUE_URL: http://elasticmq:9324/000000000000/jobs
+  SQS_DLQ_URL: http://elasticmq:9324/000000000000/jobs-dlq
+  MAX_ATTEMPTS: "3"
+  SHUTDOWN_TIMEOUT: 15s
+
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: processor
       POSTGRES_PASSWORD: processor
       POSTGRES_DB: processor
-    ports:
-      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -18,13 +33,11 @@ services:
   minio:
     # Chainguard publishes only a floating tag; pin the digest (MinIO RELEASE.2026-10-23T20-06-51Z).
     image: cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-local-access-key}
       MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-local-secret-key}
-    ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -35,11 +48,9 @@ services:
 
   elasticmq:
     image: softwaremill/elasticmq:1.6.12
+    restart: unless-stopped
     environment:
       JAVA_OPTS: "-Xms64m -Xmx256m -XX:ActiveProcessorCount=2"
-    ports:
-      - "127.0.0.1:9324:9324"
-      - "127.0.0.1:9325:9325"
     volumes:
       - ./deploy/elasticmq.conf:/opt/elasticmq.conf:ro
     healthcheck:
@@ -48,6 +59,63 @@ services:
       timeout: 3s
       retries: 20
       start_period: 30s
+
+  api:
+    build:
+      context: .
+      args:
+        SERVICE: api
+    image: async-file-processor-api
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      API_ADDR: ":8080"
+      # Demo limits. Raise DEMO_MAX_UPLOAD_BYTES for large benchmark files.
+      MAX_UPLOAD_BYTES: ${DEMO_MAX_UPLOAD_BYTES:-52428800}
+      UPLOAD_RATE_PER_MIN: ${UPLOAD_RATE_PER_MIN:-10}
+      UPLOAD_RATE_BURST: ${UPLOAD_RATE_BURST:-5}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      elasticmq: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  worker:
+    build:
+      context: .
+      args:
+        SERVICE: worker
+    image: async-file-processor-worker
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      METRICS_ADDR: ":9091"
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      RETENTION: ${RETENTION:-24h}
+      RETENTION_INTERVAL: ${RETENTION_INTERVAL:-10m}
+    deploy:
+      replicas: 2
+    # Long poll (20s) plus SHUTDOWN_TIMEOUT (15s), with headroom.
+    stop_grace_period: 45s
+    # The API applies the database migrations, so workers start after it is healthy.
+    depends_on:
+      api: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      elasticmq: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
 
 volumes:
   postgres-data:

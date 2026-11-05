@@ -50,6 +50,10 @@ type Deps struct {
 	Checks map[string]Checker
 	// Metrics receives upload and job counters and is served at /metrics. Nil uses a private set.
 	Metrics *metrics.Metrics
+	// UploadRatePerMin is the sustained POST /api/jobs rate allowed per client and UploadRateBurst
+	// the largest burst. A rate of 0 disables the limit.
+	UploadRatePerMin float64
+	UploadRateBurst  int
 }
 
 type api struct {
@@ -72,14 +76,19 @@ func NewHandler(d Deps) http.Handler {
 	})
 	mux.HandleFunc("GET /readyz", a.readyz)
 	mux.Handle("GET /metrics", d.Metrics.Handler())
-	mux.HandleFunc("POST /api/jobs", a.createJob)
+	create := a.createJob
+	if d.UploadRatePerMin > 0 {
+		burst := max(d.UploadRateBurst, 1)
+		create = rateLimit(newRateLimiter(d.UploadRatePerMin, burst), create)
+	}
+	mux.HandleFunc("POST /api/jobs", create)
 	mux.HandleFunc("GET /api/jobs/{id}", a.getJob)
 	mux.HandleFunc("GET /api/jobs", a.listJobs)
 	mux.HandleFunc("GET /api/jobs/{id}/report", a.getReport)
 	mux.HandleFunc("GET /api/jobs/{id}/errors.csv", a.getErrorsCSV)
 	mux.HandleFunc("GET /api/sample.csv", a.getSampleCSV)
 	a.registerUI(mux)
-	return requestID(logRequests(d.Logger, recoverPanics(d.Logger, jsonErrors(mux))))
+	return requestID(securityHeaders(logRequests(d.Logger, recoverPanics(d.Logger, jsonErrors(mux)))))
 }
 
 // jobResponse is the public JSON form of a job. Internal object keys are not exposed.

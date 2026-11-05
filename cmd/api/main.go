@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"async-file-processor/internal/config"
+	"async-file-processor/internal/healthcheck"
 	"async-file-processor/internal/httpapi"
 	"async-file-processor/internal/jobs"
 	"async-file-processor/internal/queue"
@@ -23,11 +25,29 @@ import (
 )
 
 func main() {
+	probe := flag.Bool("healthcheck", false, "probe the local /readyz endpoint and exit 0 if ready (for container health checks)")
+	flag.Parse()
+	if *probe {
+		os.Exit(runHealthcheck())
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
 		logger.Error("api stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func runHealthcheck() int {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := healthcheck.Probe(healthcheck.URL(cfg.APIAddr, "/readyz"), 3*time.Second); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
 }
 
 func run(logger *slog.Logger) error {
@@ -72,6 +92,7 @@ func run(logger *slog.Logger) error {
 		Addr: cfg.APIAddr,
 		Handler: httpapi.NewHandler(httpapi.Deps{
 			Store: store, Jobs: repo, Queue: jobQueue, Logger: logger, MaxUploadBytes: cfg.MaxUploadBytes, UI: web.FS(),
+			UploadRatePerMin: cfg.UploadRatePerMin, UploadRateBurst: cfg.UploadRateBurst,
 			Checks: map[string]httpapi.Checker{"db": pool.Ping, "s3": store.Check, "sqs": jobQueue.Check},
 		}),
 		ReadHeaderTimeout: 5 * time.Second,

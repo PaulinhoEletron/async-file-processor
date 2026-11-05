@@ -181,3 +181,38 @@ func (r *Repo) exec(ctx context.Context, id, op, sql string, args ...any) error 
 	}
 	return nil
 }
+
+// ListExpired returns up to limit finished (COMPLETED or FAILED) jobs whose finish time is
+// before cutoff, oldest first. Active jobs are never returned.
+func (r *Repo) ListExpired(ctx context.Context, cutoff time.Time, limit int) ([]Job, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+columns+` FROM jobs
+		 WHERE status IN ('COMPLETED', 'FAILED') AND COALESCE(finished_at, updated_at) < $1
+		 ORDER BY COALESCE(finished_at, updated_at), id LIMIT $2`, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list expired jobs: %w", err)
+	}
+	defer rows.Close()
+	var out []Job
+	for rows.Next() {
+		j, err := scan(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan job: %w", err)
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list expired jobs: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteFinished removes a COMPLETED or FAILED job and reports whether a row was deleted.
+// A missing or still-active job is left alone, so concurrent sweeps are harmless.
+func (r *Repo) DeleteFinished(ctx context.Context, id string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM jobs WHERE id = $1 AND status IN ('COMPLETED', 'FAILED')`, id)
+	if err != nil {
+		return false, fmt.Errorf("delete job %s: %w", id, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
