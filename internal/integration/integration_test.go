@@ -168,11 +168,13 @@ func TestJobs(t *testing.T) {
 		t.Fatalf("migrations are not idempotent: %v", err)
 	}
 	repo := jobs.NewRepo(pool)
+	owner := []byte(uuid.NewString()) // a unique owner per test run
+	clientKey := "client-" + uuid.NewString()
 	newJob := func(t *testing.T) string {
 		t.Helper()
 		id := uuid.NewString()
 		t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DELETE FROM jobs WHERE id = $1", id) })
-		j, err := repo.Create(ctx, id, "data.csv", "uploads/"+id+".csv")
+		j, err := repo.Create(ctx, jobs.NewJob{ID: id, Filename: "data.csv", InputKey: "uploads/" + id + ".csv", OwnerHash: owner, ClientKey: clientKey})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -232,14 +234,66 @@ func TestJobs(t *testing.T) {
 		if _, err := repo.Get(ctx, uuid.NewString()); !errors.Is(err, jobs.ErrNotFound) {
 			t.Fatalf("Get unknown id: %v, want ErrNotFound", err)
 		}
-		list, err := repo.List(ctx, 1)
+		list, err := repo.List(ctx, owner, 1)
 		if err != nil || len(list) != 1 {
 			t.Fatalf("List = %d jobs, %v", len(list), err)
 		}
 		newest := newJob(t)
-		list, err = repo.List(ctx, 5)
+		list, err = repo.List(ctx, owner, 5)
 		if err != nil || len(list) == 0 || list[0].ID != newest {
 			t.Fatalf("List is not newest first: %v", err)
+		}
+		for _, j := range list {
+			if j.Filename != "data.csv" {
+				t.Fatalf("unexpected job in list: %+v", j)
+			}
+		}
+	})
+
+	t.Run("list is scoped to the owner", func(t *testing.T) {
+		mine := newJob(t)
+		other := uuid.NewString()
+		t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DELETE FROM jobs WHERE id = $1", other) })
+		if _, err := repo.Create(ctx, jobs.NewJob{ID: other, Filename: "o.csv", InputKey: other + "/input.csv", OwnerHash: []byte("someone-else")}); err != nil {
+			t.Fatal(err)
+		}
+		list, err := repo.List(ctx, owner, 200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, j := range list {
+			if j.ID == other {
+				t.Fatal("List returned another owner's job")
+			}
+			found = found || j.ID == mine
+		}
+		if !found {
+			t.Fatal("List did not return the owner's job")
+		}
+		if none, err := repo.List(ctx, nil, 200); err != nil || len(none) != 0 {
+			t.Fatalf("List without an owner = %d jobs, %v; want none", len(none), err)
+		}
+	})
+
+	t.Run("unfinished counts", func(t *testing.T) {
+		_, before, err := repo.Unfinished(ctx, clientKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, b := newJob(t), newJob(t)
+		total, mine, err := repo.Unfinished(ctx, clientKey)
+		if err != nil || mine != before+2 || total < mine {
+			t.Fatalf("Unfinished = %d, %d, %v; want client count %d", total, mine, err, before+2)
+		}
+		if err := repo.Complete(ctx, a, "", "", 0, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Fail(ctx, b, "x"); err != nil {
+			t.Fatal(err)
+		}
+		if _, mine, err = repo.Unfinished(ctx, clientKey); err != nil || mine != before {
+			t.Fatalf("finished jobs still counted: %d, %v; want %d", mine, err, before)
 		}
 	})
 

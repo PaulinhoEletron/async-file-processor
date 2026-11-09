@@ -101,14 +101,21 @@ func TestSampleCSV(t *testing.T) {
 
 func TestSecurityHeaders(t *testing.T) {
 	h := newUIEnv()
-	for _, path := range []string{"/", "/app.js", "/api/jobs", "/nope"} {
+	for _, path := range []string{"/", "/app.js", "/api/jobs", "/api/jobs/6f1c2c1e-8a3b-4d2a-9d55-0a7d9e1f3b11/errors.csv", "/api/sample.csv", "/nope"} {
 		rec := do(h, httptest.NewRequest(http.MethodGet, path, nil))
-		for name, want := range map[string]string{
-			"Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
-			"X-Content-Type-Options":  "nosniff",
-			"X-Frame-Options":         "DENY",
-			"Referrer-Policy":         "no-referrer",
-		} {
+		want := map[string]string{
+			"Content-Security-Policy":      "default-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+			"X-Content-Type-Options":       "nosniff",
+			"X-Frame-Options":              "DENY",
+			"Referrer-Policy":              "no-referrer",
+			"Permissions-Policy":           "camera=(), microphone=(), geolocation=()",
+			"Cross-Origin-Opener-Policy":   "same-origin",
+			"Cross-Origin-Resource-Policy": "same-origin",
+		}
+		if strings.HasPrefix(path, "/api/") {
+			want["Cache-Control"] = "no-store" // job data, reports and downloads are never cached
+		}
+		for name, want := range want {
 			if got := rec.Header().Get(name); got != want {
 				t.Errorf("%s %s = %q, want %q", path, name, got, want)
 			}

@@ -183,6 +183,10 @@
           stat('Total rows', fmtNum(s.total_rows)), stat('Valid rows', fmtNum(s.valid_rows)),
           stat('Invalid rows', fmtNum(s.invalid_rows)), stat('Error lines', fmtNum(s.error_count)),
           stat('Duration', fmtDuration(s.duration_ms)), stat('Rows / sec', fmtNum(Math.round(s.rows_per_sec))));
+        if (s.errors_truncated) {
+          body.appendChild(el('div', 'notice', 'errors.csv lists the first ' + fmtNum(s.error_lines_written) +
+            ' errors. The counts below are complete.'));
+        }
         body.append(stats, breakdown('Errors by field', s.errors_by_field), breakdown('Errors by rule', s.errors_by_rule));
       })
       .catch(function (e) {

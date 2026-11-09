@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,15 +74,23 @@ func TestRateLimiterConcurrent(t *testing.T) {
 	}
 }
 
-func TestClientIP(t *testing.T) {
+func TestClientKey(t *testing.T) {
 	for _, tc := range []struct {
-		name, remote, cf, xff, want string
+		name, remote, cf, xff string
+		trust                 bool
+		want                  string
 	}{
-		{"remote only", "192.0.2.1:5555", "", "", "192.0.2.1"},
-		{"cloudflare header", "127.0.0.1:5555", "203.0.113.7", "", "203.0.113.7"},
-		{"forwarded-for ignored", "192.0.2.1:5555", "", "1.2.3.4", "192.0.2.1"},
-		{"invalid header ignored", "192.0.2.1:5555", "not-an-ip", "", "192.0.2.1"},
-		{"ipv6", "[2001:db8::1]:5555", "", "", "2001:db8::1"},
+		{"remote only", "192.0.2.1:5555", "", "", false, "192.0.2.1"},
+		{"forged header ignored by default", "192.0.2.1:5555", "203.0.113.7", "", false, "192.0.2.1"},
+		{"header honoured when trusted", "127.0.0.1:5555", "203.0.113.7", "", true, "203.0.113.7"},
+		{"trusted but absent", "192.0.2.1:5555", "", "", true, "192.0.2.1"},
+		{"forwarded-for ignored", "192.0.2.1:5555", "", "1.2.3.4", true, "192.0.2.1"},
+		{"invalid header ignored", "192.0.2.1:5555", "not-an-ip", "", true, "192.0.2.1"},
+		{"ipv4-mapped header", "127.0.0.1:5555", "::ffff:203.0.113.7", "", true, "203.0.113.7"},
+		{"ipv4-mapped remote", "[::ffff:192.0.2.9]:5555", "", "", false, "192.0.2.9"},
+		{"ipv6 keyed by /64", "[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:5555", "", "", false, "2001:db8:1:2::/64"},
+		{"ipv6 zone stripped", "[fe80::1%eth0]:5555", "", "", false, "fe80::/64"},
+		{"ipv6 zone in header", "127.0.0.1:5555", "fe80::1%eth0", "", true, "fe80::/64"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest("POST", "/api/jobs", nil)
@@ -92,17 +101,55 @@ func TestClientIP(t *testing.T) {
 			if tc.xff != "" {
 				r.Header.Set("X-Forwarded-For", tc.xff)
 			}
-			if got := clientIP(r); got != tc.want {
-				t.Fatalf("clientIP = %q, want %q", got, tc.want)
+			if got := clientKey(r, tc.trust); got != tc.want {
+				t.Fatalf("clientKey = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestClientKeySameIPv6PrefixSharesKey(t *testing.T) {
+	key := func(remote string) string {
+		r := httptest.NewRequest("POST", "/", nil)
+		r.RemoteAddr = remote
+		return clientKey(r, false)
+	}
+	if key("[2001:db8:1:2::1]:1") != key("[2001:db8:1:2:ffff::9]:2") {
+		t.Fatal("addresses in one /64 must share a key")
+	}
+	if key("[2001:db8:1:2::1]:1") == key("[2001:db8:1:3::1]:1") {
+		t.Fatal("different /64 prefixes must not share a key")
+	}
+}
+
+func TestRateLimiterOverflowBucket(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := newRateLimiter(60, 2)
+	l.maxKeys = 2
+	l.now = func() time.Time { return now }
+	l.allow("a")
+	l.allow("b")
+	// The table is full: new clients are not refused but share one bucket.
+	for i := 0; i < 2; i++ {
+		if ok, _ := l.allow(fmt.Sprintf("new-%d", i)); !ok {
+			t.Fatalf("overflow client %d refused while the shared bucket had tokens", i)
+		}
+	}
+	if ok, _ := l.allow("new-9"); ok {
+		t.Fatal("the shared overflow bucket should be exhausted")
+	}
+	if len(l.clients) != 3 {
+		t.Fatalf("clients = %d, want 2 + overflow", len(l.clients))
+	}
+	if ok, _ := l.allow("a"); !ok {
+		t.Fatal("an existing client keeps its own bucket")
 	}
 }
 
 func TestUploadRateLimitResponse(t *testing.T) {
 	h := NewHandler(Deps{
 		Store: &fakeStore{}, Jobs: &fakeJobs{}, Queue: &fakeQueue{},
-		MaxUploadBytes: 1 << 20, UploadRatePerMin: 1, UploadRateBurst: 2,
+		MaxUploadBytes: 1 << 20, UploadRatePerMin: 1, UploadRateBurst: 2, TrustCFConnectingIP: true,
 	})
 	post := func(ip string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/api/jobs", strings.NewReader("x"))
@@ -132,5 +179,24 @@ func TestUploadRateLimitResponse(t *testing.T) {
 	req.Header.Set("CF-Connecting-IP", "203.0.113.1")
 	if rec := httptest.NewRecorder(); func() int { h.ServeHTTP(rec, req); return rec.Code }() != 200 {
 		t.Fatal("healthz must not be rate limited")
+	}
+}
+
+func TestForgedClientIPDoesNotEvadeLimitByDefault(t *testing.T) {
+	h := NewHandler(Deps{
+		Store: &fakeStore{}, Jobs: &fakeJobs{}, Queue: &fakeQueue{},
+		MaxUploadBytes: 1 << 20, UploadRatePerMin: 1, UploadRateBurst: 2,
+	})
+	var last int
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest("POST", "/api/jobs", strings.NewReader("x"))
+		req.RemoteAddr = "192.0.2.50:4000"
+		req.Header.Set("CF-Connecting-IP", fmt.Sprintf("203.0.113.%d", i+1))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		last = rec.Code
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("status after 4 requests with rotating forged headers = %d, want 429", last)
 	}
 }

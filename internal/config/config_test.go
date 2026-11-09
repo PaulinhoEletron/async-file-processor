@@ -12,6 +12,9 @@ func TestLoad(t *testing.T) {
 		"S3_ENDPOINT", "S3_BUCKET", "SQS_ENDPOINT", "SQS_QUEUE_URL",
 		"WORKER_CONCURRENCY", "MAX_UPLOAD_BYTES", "MAX_ATTEMPTS", "FAIL_RATE",
 		"UPLOAD_RATE_PER_MIN", "UPLOAD_RATE_BURST", "RETENTION", "RETENTION_INTERVAL",
+		"TRUST_CF_CONNECTING_IP", "COOKIE_SECURE", "UPLOAD_IDLE_TIMEOUT", "UPLOAD_MAX_DURATION",
+		"MAX_CONCURRENT_UPLOADS", "MAX_UNFINISHED_JOBS", "MAX_UNFINISHED_PER_CLIENT",
+		"MAX_ERROR_LINES", "MAX_RECORD_BYTES", "API_METRICS_ADDR",
 	} {
 		t.Setenv(key, "")
 	}
@@ -30,6 +33,12 @@ func TestLoad(t *testing.T) {
 	}
 	if cfg.UploadRatePerMin != 10 || cfg.UploadRateBurst != 5 || cfg.Retention != 24*time.Hour || cfg.RetentionInterval != 10*time.Minute {
 		t.Fatalf("unexpected limit/retention defaults: %+v", cfg)
+	}
+	if cfg.TrustCFConnectingIP || cfg.CookieSecure || cfg.UploadIdleTimeout != 30*time.Second ||
+		cfg.UploadMaxDuration != 10*time.Minute || cfg.MaxConcurrentUploads != 16 ||
+		cfg.MaxUnfinishedJobs != 50 || cfg.MaxUnfinishedPerClient != 3 ||
+		cfg.MaxErrorLines != 50000 || cfg.MaxRecordBytes != 1<<20 || cfg.APIMetricsAddr != ":9090" {
+		t.Fatalf("unexpected safeguard defaults: %+v", cfg)
 	}
 	t.Setenv("SQS_DLQ_URL", "")
 	if cfg, err = Load(); err != nil || cfg.SQSDLQURL != "" {
@@ -61,6 +70,15 @@ func TestLoad(t *testing.T) {
 		{"RETENTION", "-1h"},
 		{"RETENTION", "soon"},
 		{"RETENTION_INTERVAL", "0s"},
+		{"TRUST_CF_CONNECTING_IP", "maybe"},
+		{"COOKIE_SECURE", "2x"},
+		{"UPLOAD_IDLE_TIMEOUT", "-1s"},
+		{"UPLOAD_MAX_DURATION", "soon"},
+		{"MAX_CONCURRENT_UPLOADS", "-1"},
+		{"MAX_UNFINISHED_JOBS", "many"},
+		{"MAX_UNFINISHED_PER_CLIENT", "-2"},
+		{"MAX_ERROR_LINES", "0"},
+		{"MAX_RECORD_BYTES", "0"},
 	} {
 		t.Run(tc.key+"/"+tc.value, func(t *testing.T) {
 			t.Setenv(tc.key, tc.value)

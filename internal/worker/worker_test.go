@@ -281,7 +281,7 @@ func TestFinalAttemptFailsJobAndReleasesMessage(t *testing.T) {
 		t.Fatalf("events = %v, want [vis:0s]", ev)
 	}
 	msg, failed := j.failedMsg("job-1")
-	if !failed || !strings.Contains(msg, "giving up after 3 attempts") || !strings.Contains(msg, "boom") {
+	if !failed || msg != "processing failed after 3 attempts" {
 		t.Fatalf("failure message = %q (failed=%v)", msg, failed)
 	}
 }
@@ -298,7 +298,7 @@ func TestFinalDeliveryUsesReceiveCount(t *testing.T) {
 	if ev := q.snapshot(); len(ev) != 1 || ev[0] != "vis:0s" {
 		t.Fatalf("events = %v, want [vis:0s]", ev)
 	}
-	if msg, failed := j.failedMsg("job-1"); !failed || !strings.Contains(msg, "giving up after 3 attempts") {
+	if msg, failed := j.failedMsg("job-1"); !failed || msg != "processing failed after 3 attempts" {
 		t.Fatalf("failure message = %q (failed=%v)", msg, failed)
 	}
 }

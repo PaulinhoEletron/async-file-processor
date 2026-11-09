@@ -3,6 +3,7 @@ package processor
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"async-file-processor/internal/jobs"
 )
@@ -354,5 +356,161 @@ func TestProcessSummaryUploadFailure(t *testing.T) {
 	res, err := p.Process(context.Background(), jobs.Job{ID: "job1", InputKey: "in"})
 	if err == nil || !strings.Contains(err.Error(), "summary refused") || res.ReportKey != "" {
 		t.Fatalf("res=%+v err=%v", res, err)
+	}
+}
+
+func runWith(t *testing.T, store *fakeStore, opts ...Option) (Result, error) {
+	t.Helper()
+	p := New(store, &fakeProgress{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts...)
+	return p.Process(context.Background(), jobs.Job{ID: "job1", InputKey: "in"})
+}
+
+func readCSV(t *testing.T, s string) [][]string {
+	t.Helper()
+	rows, err := csv.NewReader(strings.NewReader(s)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func summaryOf(t *testing.T, store *fakeStore) Summary {
+	t.Helper()
+	var sum Summary
+	if err := json.Unmarshal([]byte(store.objects["job1/summary.json"]), &sum); err != nil {
+		t.Fatal(err)
+	}
+	return sum
+}
+
+func TestErrorLinesCapKeepsCountsExact(t *testing.T) {
+	const rows, cap = 200, 100
+	var b strings.Builder
+	b.WriteString(header)
+	for i := 1; i <= rows; i++ {
+		fmt.Fprintf(&b, "%d,,x,-1,zz,Q\n", i) // five errors per row
+	}
+	store := newStore("in", b.String())
+	res, err := runWith(t, store, WithMaxErrorLines(cap))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Total != rows || res.Invalid != rows || res.Valid != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	lines := readCSV(t, store.objects["job1/errors.csv"])
+	if len(lines) != cap+1 {
+		t.Fatalf("errors.csv has %d records, want %d (cap plus header)", len(lines), cap+1)
+	}
+	sum := summaryOf(t, store)
+	if !sum.ErrorsTruncated || sum.ErrorLinesWritten != cap {
+		t.Fatalf("truncated=%v written=%d", sum.ErrorsTruncated, sum.ErrorLinesWritten)
+	}
+	if sum.ErrorCount != rows*5 || sum.InvalidRows != rows || sum.TotalRows != rows {
+		t.Fatalf("counts are not exact: %+v", sum)
+	}
+	for _, field := range []string{"name", "email", "amount", "date", "country"} {
+		if sum.ErrorsByField[field] != rows {
+			t.Fatalf("errors_by_field[%s] = %d, want %d", field, sum.ErrorsByField[field], rows)
+		}
+	}
+}
+
+func TestErrorLinesUnderCapNotTruncated(t *testing.T) {
+	store := newStore("in", header+"1,,a@example.com,1,2024-01-01,US\n")
+	if _, err := runWith(t, store, WithMaxErrorLines(1)); err != nil {
+		t.Fatal(err)
+	}
+	if sum := summaryOf(t, store); sum.ErrorsTruncated || sum.ErrorLinesWritten != 1 {
+		t.Fatalf("summary = %+v", sum)
+	}
+}
+
+func TestRawOnlyOnFirstErrorLineOfRow(t *testing.T) {
+	store := newStore("in", header+"7,,x,-1,2024-01-01,US\n")
+	if _, err := runWith(t, store); err != nil {
+		t.Fatal(err)
+	}
+	lines := readCSV(t, store.objects["job1/errors.csv"])
+	if len(lines) != 4 { // header, name, email, amount
+		t.Fatalf("lines = %v", lines)
+	}
+	if lines[1][3] != "7,,x,-1,2024-01-01,US" {
+		t.Fatalf("first line raw = %q", lines[1][3])
+	}
+	for _, l := range lines[2:] {
+		if l[3] != "" {
+			t.Fatalf("raw repeated on a later line of the row: %v", l)
+		}
+	}
+}
+
+func TestRawIsTruncatedOnRuneBoundary(t *testing.T) {
+	name := strings.Repeat("é", 2000) // 4000 bytes, names over 100 chars are invalid
+	store := newStore("in", header+"1,"+name+",a@example.com,1,2024-01-01,US\n")
+	if _, err := runWith(t, store); err != nil {
+		t.Fatal(err)
+	}
+	raw := readCSV(t, store.objects["job1/errors.csv"])[1][3]
+	if !strings.HasSuffix(raw, "…") || len(raw) > maxRawBytes+len("…") {
+		t.Fatalf("raw not truncated: %d bytes", len(raw))
+	}
+	if !utf8.ValidString(raw) {
+		t.Fatal("truncation split a UTF-8 sequence")
+	}
+	if got := truncateRaw("short"); got != "short" {
+		t.Fatalf("short raw changed: %q", got)
+	}
+}
+
+func TestFormulaInjectionNeutralised(t *testing.T) {
+	store := newStore("in", header+"@SUM(1+1),A,bad,1,2024-01-01,US\n=1+1,B,b@example.com,1,2024-01-01,US\n")
+	if _, err := runWith(t, store); err != nil {
+		t.Fatal(err)
+	}
+	lines := readCSV(t, store.objects["job1/errors.csv"])
+	for _, l := range lines[1:] {
+		for _, cell := range l {
+			if cell != "" && strings.ContainsAny(cell[:1], "=+-@\t\r") {
+				t.Fatalf("cell %q can be read as a formula: %v", cell, l)
+			}
+		}
+	}
+	if !strings.HasPrefix(lines[1][3], "'@SUM") {
+		t.Fatalf("raw = %q", lines[1][3])
+	}
+	if neutralise("plain") != "plain" || neutralise("") != "" || neutralise("-5") != "'-5" || neutralise("\tx") != "'\tx" {
+		t.Fatal("neutralise misbehaves")
+	}
+}
+
+func TestRecordTooLargeFailsJob(t *testing.T) {
+	big := strings.Repeat("a", 3<<20)
+	for name, content := range map[string]string{
+		"single long line":   header + "1," + big + ",a@example.com,1,2024-01-01,US\n",
+		"unterminated quote": header + "1,A,a@example.com,1,2024-01-01,US\n2,\"" + big + "\n3,B,b@example.com,1,2024-01-01,US\n",
+		"huge header":        "id,name,email,amount,date,country," + big + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newStore("in", content)
+			_, err := runWith(t, store)
+			if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "larger than 1 MiB") {
+				t.Fatalf("err = %v, want ErrInvalidInput about the record size", err)
+			}
+		})
+	}
+	store := newStore("in", header+"1,A,a@example.com,1,2024-01-01,US\n2,\""+big+"\n")
+	_, err := runWith(t, store)
+	if err == nil || !strings.Contains(err.Error(), "row 2 is larger") {
+		t.Fatalf("err = %v, want the offending row number", err)
+	}
+}
+
+func TestRecordUnderLimitIsAccepted(t *testing.T) {
+	name := strings.Repeat("n", 500<<10) // a 500 KiB cell: invalid name, but a readable record
+	store := newStore("in", header+"1,"+name+",a@example.com,1,2024-01-01,US\n2,B,b@example.com,1,2024-01-01,US\n")
+	res, err := runWith(t, store)
+	if err != nil || res.Total != 2 || res.Invalid != 1 {
+		t.Fatalf("res = %+v, err = %v", res, err)
 	}
 }

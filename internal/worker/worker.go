@@ -290,7 +290,9 @@ func (w *Worker) handle(ctx context.Context, workerID int, m queue.Msg) {
 func (w *Worker) handleTransient(ctx context.Context, log *slog.Logger, m queue.Msg, job jobs.Job, err error, duration string) {
 	attempt := max(job.Attempts, m.ReceiveCount)
 	if attempt >= w.cfg.MaxAttempts {
-		msg := fmt.Sprintf("giving up after %d attempts: %v", attempt, err)
+		// The stored message is shown to anyone holding the job id, so it stays generic; the
+		// detailed error goes to the log only.
+		msg := fmt.Sprintf("processing failed after %d attempts", attempt)
 		if failErr := w.jobs.Fail(ctx, job.ID, msg); failErr != nil {
 			log.Error("mark job failed; leaving message for redelivery", "error", failErr)
 			return

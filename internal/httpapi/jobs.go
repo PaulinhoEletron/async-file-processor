@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"async-file-processor/internal/jobs"
 	"async-file-processor/internal/metrics"
@@ -29,7 +31,16 @@ const (
 // job and enqueues it. The body is never buffered or parsed into memory.
 func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 	log := loggerFrom(r.Context(), a.Logger)
-	r.Body = http.MaxBytesReader(w, r.Body, a.MaxUploadBytes)
+	rc := http.NewResponseController(w)
+	body := &deadlineReader{r: r.Body, setDead: rc.SetReadDeadline, idle: a.UploadIdleTimeout}
+	if a.UploadMaxDuration > 0 {
+		body.hard = time.Now().Add(a.UploadMaxDuration)
+	}
+	r.Body = http.MaxBytesReader(w, body, a.MaxUploadBytes)
+	// Clear the deadline once the body has been consumed: a leftover one would later break the
+	// server's detection of a client that disconnects.
+	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
+
 	mr, err := r.MultipartReader()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "request must be multipart/form-data")
@@ -37,16 +48,16 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 	part, err := filePart(mr)
 	if err != nil {
-		a.uploadError(w, r, err, "read upload")
+		a.uploadError(w, r, body, err, "read upload")
 		return
 	}
 	if part == nil {
 		writeError(w, http.StatusBadRequest, `missing multipart field "file"`)
 		return
 	}
-	filename := path.Base(strings.ReplaceAll(part.FileName(), `\`, "/"))
-	if !strings.EqualFold(path.Ext(filename), ".csv") {
-		writeError(w, http.StatusBadRequest, "file must have a .csv extension")
+	filename, err := cleanFilename(part.FileName())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -54,16 +65,31 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 	key := id + "/input.csv"
 	counted := &countingReader{r: part}
 	if err := a.Store.Put(r.Context(), key, counted); err != nil {
-		a.uploadError(w, r, err, "store upload")
+		a.uploadError(w, r, body, err, "store upload")
 		return
 	}
+	_ = rc.SetReadDeadline(time.Time{})
 	a.Metrics.UploadBytes.Add(float64(counted.n))
+
+	// The browser keeps the cookie it already has; a new one is issued on its first upload.
+	owner, hasOwner := ownerFromRequest(r)
+	var token string
+	if !hasOwner {
+		if token, owner, err = newOwnerToken(); err != nil {
+			log.Error("mint owner token", "error", err)
+			a.removeUpload(r, key)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
 
 	// Persist and enqueue with a context that survives a client disconnect, so a stored
 	// object is not left without a job record.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
 	defer cancel()
-	job, err := a.Jobs.Create(ctx, id, filename, key)
+	job, err := a.Jobs.Create(ctx, jobs.NewJob{
+		ID: id, Filename: filename, InputKey: key, OwnerHash: owner, ClientKey: a.hashedClientKey(r),
+	})
 	if err != nil {
 		log.Error("create job", "error", err, "job_id", id)
 		if delErr := a.Store.Delete(ctx, key); delErr != nil {
@@ -72,8 +98,8 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body, _ := json.Marshal(map[string]string{"job_id": id})
-	if err := a.Queue.Send(ctx, string(body)); err != nil {
+	msg, _ := json.Marshal(map[string]string{"job_id": id})
+	if err := a.Queue.Send(ctx, string(msg)); err != nil {
 		log.Error("enqueue job", "error", err, "job_id", id)
 		if failErr := a.Jobs.Fail(ctx, id, "failed to enqueue job"); failErr != nil {
 			log.Error("mark job failed", "error", failErr, "job_id", id)
@@ -83,14 +109,59 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Metrics.JobsTotal.WithLabelValues(metrics.StatusCreated).Inc()
 	log.Info("job created", "job_id", id, "filename", filename, "bytes", counted.n)
+	if !hasOwner {
+		a.setOwnerCookie(w, token)
+	}
 	writeJSON(w, http.StatusAccepted, newJobResponse(job))
 }
 
-// filePart advances to the part named "file". It returns nil when there is none.
+func (a *api) removeUpload(r *http.Request, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
+	if err := a.Store.Delete(ctx, key); err != nil {
+		loggerFrom(r.Context(), a.Logger).Error("remove orphaned upload", "error", err, "key", key)
+	}
+}
+
+const maxFilenameRunes = 255
+
+// cleanFilename reduces an uploaded file name to a safe display name: any directory part is
+// dropped, control and bidirectional-override characters are removed, and the result must be
+// valid UTF-8, at most 255 characters and end in .csv.
+func cleanFilename(raw string) (string, error) {
+	if !utf8.ValidString(raw) {
+		return "", errors.New("filename must be valid UTF-8")
+	}
+	if len(raw) > 8*maxFilenameRunes*4 { // cheap bound before any per-rune work
+		return "", errors.New("filename too long")
+	}
+	name := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || isBidiControl(r) {
+			return -1
+		}
+		return r
+	}, path.Base(strings.ReplaceAll(raw, `\`, "/")))
+	if utf8.RuneCountInString(name) > maxFilenameRunes {
+		return "", errors.New("filename too long")
+	}
+	if !strings.EqualFold(path.Ext(name), ".csv") {
+		return "", errors.New("file must have a .csv extension")
+	}
+	return name, nil
+}
+
+// isBidiControl reports Unicode directional marks, embeddings, overrides and isolates, which can
+// make a file name display differently from what it contains.
+func isBidiControl(r rune) bool {
+	return r == 0x200E || r == 0x200F || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069)
+}
+
+// filePart advances to the part named "file". It returns nil when the body ends cleanly without
+// one. A body that ends without the closing boundary is an error, not "no file".
 func filePart(mr *multipart.Reader) (*multipart.Part, error) {
 	for {
 		p, err := mr.NextPart()
-		if errors.Is(err, io.EOF) {
+		if err == io.EOF { // only a clean end of the stream; a truncated body wraps the error
 			return nil, nil
 		}
 		if err != nil {
@@ -103,21 +174,25 @@ func filePart(mr *multipart.Reader) (*multipart.Part, error) {
 }
 
 // uploadError maps a failure while reading or storing the upload to a response.
-func (a *api) uploadError(w http.ResponseWriter, r *http.Request, err error, what string) {
+func (a *api) uploadError(w http.ResponseWriter, r *http.Request, body *deadlineReader, err error, what string) {
 	var tooBig *http.MaxBytesError
-	if errors.As(err, &tooBig) {
+	switch {
+	case body.timedOut.Load():
+		w.Header().Set("Connection", "close")
+		writeError(w, http.StatusRequestTimeout, "upload timed out")
+	case errors.As(err, &tooBig):
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("file exceeds the %d byte upload limit", a.MaxUploadBytes))
-		return
-	}
-	if r.Context().Err() != nil {
-		return // client went away; nothing to send
-	}
-	loggerFrom(r.Context(), a.Logger).Error(what, "error", err)
-	if what == "read upload" {
+	case r.Context().Err() != nil:
+		// client went away; nothing to send
+	case errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF):
+		writeError(w, http.StatusBadRequest, "incomplete upload")
+	case what == "read upload":
+		loggerFrom(r.Context(), a.Logger).Warn(what, "error", err)
 		writeError(w, http.StatusBadRequest, "malformed multipart body")
-		return
+	default:
+		loggerFrom(r.Context(), a.Logger).Error(what, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
 	}
-	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
 // getJob returns one job. A malformed id is a 400; an unknown id is a 404.
@@ -140,7 +215,7 @@ func (a *api) getJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, newJobResponse(job))
 }
 
-// listJobs returns the newest jobs first. limit defaults to 50 and is capped at 200.
+// listJobs returns the caller's own jobs, newest first. limit defaults to 50 and is capped at 200.
 func (a *api) listJobs(w http.ResponseWriter, r *http.Request) {
 	limit := defaultListLimit
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -151,7 +226,15 @@ func (a *api) listJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = min(n, maxListLimit)
 	}
-	list, err := a.Jobs.List(r.Context(), limit)
+	// The list is private to the browser that uploaded the jobs. Without a valid owner cookie
+	// there is nothing to show. A job's own id remains a capability link for its detail,
+	// report and errors.csv.
+	owner, ok := ownerFromRequest(r)
+	if !ok {
+		writeJSON(w, http.StatusOK, []jobResponse{})
+		return
+	}
+	list, err := a.Jobs.List(r.Context(), owner, limit)
 	if err != nil {
 		loggerFrom(r.Context(), a.Logger).Error("list jobs", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")

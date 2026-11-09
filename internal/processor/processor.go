@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"async-file-processor/internal/jobs"
 	"async-file-processor/internal/validate"
@@ -21,6 +22,18 @@ import (
 
 // ProgressEvery is the number of rows between progress updates.
 const ProgressEvery = 5000
+
+const (
+	// DefaultMaxErrorLines is the default number of lines written to errors.csv per job.
+	DefaultMaxErrorLines int64 = 50_000
+	// DefaultMaxRecordBytes is the default size limit for one CSV record.
+	DefaultMaxRecordBytes = 1 << 20
+
+	// maxRawBytes bounds the raw-row cell of an errors.csv line.
+	maxRawBytes = 1024
+	// readSlack covers the CSV reader's look-ahead buffering beyond a record's end.
+	readSlack = 64 << 10
+)
 
 // ErrInvalidInput marks input that can never be processed successfully, such as a missing or
 // wrong header. Retrying the job will not help.
@@ -39,6 +52,10 @@ type Summary struct {
 	ErrorsByRule map[string]int64 `json:"errors_by_rule"`
 	DurationMS   int64            `json:"duration_ms"`
 	RowsPerSec   float64          `json:"rows_per_sec"`
+	// ErrorLinesWritten is the number of lines in errors.csv, excluding the header. When the
+	// per-job cap is reached ErrorsTruncated is set; every count above stays exact.
+	ErrorLinesWritten int64 `json:"error_lines_written"`
+	ErrorsTruncated   bool  `json:"errors_truncated"`
 }
 
 // errorsHeader is the first line of every errors file.
@@ -66,14 +83,98 @@ type Result struct {
 
 // Processor validates CSV files stored in object storage.
 type Processor struct {
-	store    Store
-	progress Progress
-	logger   *slog.Logger
+	store          Store
+	progress       Progress
+	logger         *slog.Logger
+	maxErrorLines  int64
+	maxRecordBytes int
+}
+
+// Option tunes a Processor.
+type Option func(*Processor)
+
+// WithMaxErrorLines caps the lines written to errors.csv per job. Counting continues past it.
+func WithMaxErrorLines(n int64) Option {
+	return func(p *Processor) {
+		if n > 0 {
+			p.maxErrorLines = n
+		}
+	}
+}
+
+// WithMaxRecordBytes sets the largest CSV record accepted; a bigger one fails the job.
+func WithMaxRecordBytes(n int) Option {
+	return func(p *Processor) {
+		if n > 0 {
+			p.maxRecordBytes = n
+		}
+	}
 }
 
 // New returns a Processor.
-func New(store Store, progress Progress, logger *slog.Logger) *Processor {
-	return &Processor{store: store, progress: progress, logger: logger}
+func New(store Store, progress Progress, logger *slog.Logger, opts ...Option) *Processor {
+	p := &Processor{store: store, progress: progress, logger: logger,
+		maxErrorLines: DefaultMaxErrorLines, maxRecordBytes: DefaultMaxRecordBytes}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
+}
+
+// errRecordTooLarge is returned by recordGuard once a record outgrows the limit.
+var errRecordTooLarge = errors.New("record too large")
+
+// recordGuard sits between the object body and the CSV reader and refuses to supply more than
+// limit bytes, so one enormous record (or an unterminated quote that swallows the file) cannot
+// grow the reader's buffers without bound. The limit is moved forward after every record.
+type recordGuard struct {
+	r     io.Reader
+	n     int64 // bytes handed to the reader so far
+	limit int64
+}
+
+func (g *recordGuard) Read(p []byte) (int, error) {
+	if g.n >= g.limit {
+		return 0, errRecordTooLarge
+	}
+	if left := g.limit - g.n; int64(len(p)) > left {
+		p = p[:left]
+	}
+	n, err := g.r.Read(p)
+	g.n += int64(n)
+	return n, err
+}
+
+// formatSize renders a byte limit for messages ("1 MiB", "512 KiB" or "100 bytes").
+func formatSize(n int) string {
+	switch {
+	case n%(1<<20) == 0:
+		return fmt.Sprintf("%d MiB", n>>20)
+	case n%(1<<10) == 0:
+		return fmt.Sprintf("%d KiB", n>>10)
+	}
+	return fmt.Sprintf("%d bytes", n)
+}
+
+// truncateRaw shortens s to at most maxRawBytes, cutting on a UTF-8 boundary, and marks the cut.
+func truncateRaw(s string) string {
+	if len(s) <= maxRawBytes {
+		return s
+	}
+	cut := maxRawBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// neutralise stops spreadsheet applications from reading a cell as a formula by prefixing a
+// quote when it starts with a character they treat as one.
+func neutralise(s string) string {
+	if s != "" && strings.IndexByte("=+-@\t\r", s[0]) >= 0 {
+		return "'" + s
+	}
+	return s
 }
 
 // ErrorsKey returns the object key of the errors file for a job.
@@ -82,8 +183,14 @@ func ErrorsKey(jobID string) string { return jobID + "/errors.csv" }
 // SummaryKey returns the object key of the summary report for a job.
 func SummaryKey(jobID string) string { return jobID + "/summary.json" }
 
+func isParseError(err error) bool {
+	var perr *csv.ParseError
+	return errors.As(err, &perr)
+}
+
 // Process reads the job's input, validates every row, and uploads {id}/errors.csv with one line
-// per failed rule, then uploads {id}/summary.json. The errors file is always written, header
+// per failed rule (the raw row only on a row's first line, and at most the configured number of
+// lines per job), then uploads {id}/summary.json. The errors file is always written, header
 // only when every row is valid. The summary is written only after the errors file is stored.
 //
 // Input that cannot be processed (empty file, wrong header, unreadable CSV structure) returns an
@@ -97,7 +204,8 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 	}
 	defer body.Close()
 
-	r := csv.NewReader(body)
+	guard := &recordGuard{r: body, limit: int64(p.maxRecordBytes) + readSlack}
+	r := csv.NewReader(guard)
 	r.ReuseRecord = true
 	r.FieldsPerRecord = -1 // width is checked per row so a bad row does not abort the file
 
@@ -105,6 +213,8 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 	switch {
 	case errors.Is(err, io.EOF):
 		return Result{}, fmt.Errorf("%w: file is empty, expected header %s", ErrInvalidInput, strings.Join(validate.Header, ","))
+	case errors.Is(err, errRecordTooLarge):
+		return Result{}, fmt.Errorf("%w: the header row is larger than %s", ErrInvalidInput, formatSize(p.maxRecordBytes))
 	case err != nil:
 		return Result{}, fmt.Errorf("%w: read header: %v", ErrInvalidInput, err)
 	}
@@ -151,13 +261,16 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 	}
 
 	for {
+		guard.limit = r.InputOffset() + int64(p.maxRecordBytes) + readSlack
 		rec, readErr := r.Read()
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
+		if errors.Is(readErr, errRecordTooLarge) {
+			return Result{}, fmt.Errorf("%w: row %d is larger than %s", ErrInvalidInput, res.Total+1, formatSize(p.maxRecordBytes))
+		}
 		var perr *csv.ParseError
 		var errs []validate.FieldError
-		var rawRec string
 		switch {
 		case errors.As(readErr, &perr):
 			errs = []validate.FieldError{{Field: validate.RowField, Rule: validate.RuleMalformedCSV, Message: fmt.Sprintf("malformed CSV at line %d, column %d: %v", perr.Line, perr.Column, perr.Err)}}
@@ -165,9 +278,6 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 			return Result{}, fmt.Errorf("read input: %w", readErr)
 		default:
 			errs = v.ValidateRow(rec)
-			if len(errs) > 0 {
-				rawRec = rawOf(rec)
-			}
 		}
 
 		res.Total++
@@ -176,13 +286,23 @@ func (p *Processor) Process(ctx context.Context, job jobs.Job) (res Result, err 
 		} else {
 			res.Invalid++
 			rowNum := strconv.FormatInt(res.Total, 10)
-			for _, fe := range errs {
+			for i, fe := range errs {
 				sum.ErrorCount++
 				sum.ErrorsByField[fe.Field]++
 				sum.ErrorsByRule[fe.Field+"."+fe.Rule]++
-				if err := out.Write([]string{rowNum, fe.Field, fe.Message, rawRec}); err != nil {
+				if sum.ErrorLinesWritten >= p.maxErrorLines {
+					sum.ErrorsTruncated = true
+					continue
+				}
+				// The raw row is shown once per row, on its first error line, and shortened.
+				rawCell := ""
+				if i == 0 && rec != nil && !isParseError(readErr) {
+					rawCell = neutralise(truncateRaw(rawOf(rec)))
+				}
+				if err := out.Write([]string{rowNum, neutralise(fe.Field), neutralise(fe.Message), rawCell}); err != nil {
 					return Result{}, fmt.Errorf("write errors file: %w", err)
 				}
+				sum.ErrorLinesWritten++
 			}
 		}
 		if res.Total%ProgressEvery == 0 {

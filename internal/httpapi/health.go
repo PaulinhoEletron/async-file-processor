@@ -11,9 +11,10 @@ import (
 const checkTimeout = 2 * time.Second
 
 // readyz probes every dependency concurrently, each bounded by checkTimeout. It answers 200 when
-// all succeed and 503 with the error text of the failing ones otherwise.
+// all succeed and 503 naming the failing ones otherwise (their error text is logged, not returned).
 func (a *api) readyz(w http.ResponseWriter, r *http.Request) {
 	results := make(map[string]string, len(a.Checks))
+	details := make(map[string]string)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	ready := true
@@ -23,21 +24,23 @@ func (a *api) readyz(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(r.Context(), checkTimeout)
 			defer cancel()
-			res := "ok"
+			res, detail := "ok", ""
 			if err := check(ctx); err != nil {
-				res = err.Error()
+				// The response says only that a dependency is down; the cause is logged.
+				res, detail = "unavailable", err.Error()
 			}
 			mu.Lock()
 			results[name] = res
 			if res != "ok" {
 				ready = false
+				details[name] = detail
 			}
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 	if !ready {
-		loggerFrom(r.Context(), a.Logger).Warn("not ready", "checks", results)
+		loggerFrom(r.Context(), a.Logger).Warn("not ready", "checks", details)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "unavailable", "checks": results})
 		return
 	}

@@ -16,6 +16,7 @@ import (
 	"async-file-processor/internal/healthcheck"
 	"async-file-processor/internal/httpapi"
 	"async-file-processor/internal/jobs"
+	"async-file-processor/internal/metrics"
 	"async-file-processor/internal/queue"
 	"async-file-processor/internal/storage"
 	"async-file-processor/migrations"
@@ -87,37 +88,66 @@ func run(logger *slog.Logger) error {
 	}
 
 	repo := jobs.NewRepo(pool)
-	// No Read/WriteTimeout: large uploads stream for as long as the client needs.
+	m := metrics.New()
+	// No Read/WriteTimeout: large uploads stream for as long as the client keeps sending; the
+	// handler enforces an idle and an overall deadline on the upload body itself.
 	server := &http.Server{
 		Addr: cfg.APIAddr,
 		Handler: httpapi.NewHandler(httpapi.Deps{
 			Store: store, Jobs: repo, Queue: jobQueue, Logger: logger, MaxUploadBytes: cfg.MaxUploadBytes, UI: web.FS(),
+			Metrics:          m,
 			UploadRatePerMin: cfg.UploadRatePerMin, UploadRateBurst: cfg.UploadRateBurst,
+			TrustCFConnectingIP: cfg.TrustCFConnectingIP, CookieSecure: cfg.CookieSecure,
+			UploadIdleTimeout: cfg.UploadIdleTimeout, UploadMaxDuration: cfg.UploadMaxDuration,
+			MaxConcurrentUploads: cfg.MaxConcurrentUploads,
+			MaxUnfinishedJobs:    cfg.MaxUnfinishedJobs, MaxUnfinishedPerClient: cfg.MaxUnfinishedPerClient,
 			Checks: map[string]httpapi.Checker{"db": pool.Ping, "s3": store.Check, "sqs": jobQueue.Check},
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	serverErrors := make(chan error, 1)
+	// Metrics are served on their own listener, which is not published outside the container
+	// network, so the public API never exposes them.
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", m.Handler())
+	metricsServer := &http.Server{Addr: cfg.APIMetricsAddr, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+
+	serverErrors := make(chan error, 2)
 	go func() {
 		logger.Info("api listening", "addr", cfg.APIAddr)
 		serverErrors <- server.ListenAndServe()
 	}()
+	go func() {
+		logger.Info("metrics listening", "addr", cfg.APIMetricsAddr)
+		serverErrors <- metricsServer.ListenAndServe()
+	}()
+	var runErr error
 	select {
-	case err := <-serverErrors:
-		return err
+	case runErr = <-serverErrors:
 	case <-ctx.Done():
 		stop()
 	}
 	logger.Info("api shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		_ = server.Close()
-		return err
+	for _, srv := range []*http.Server{server, metricsServer} {
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+			runErr = errors.Join(runErr, err)
+		}
 	}
-	if err := <-serverErrors; !errors.Is(err, http.ErrServerClosed) {
-		return err
+	// Both servers have stopped; collect what they reported.
+	for range 2 {
+		select {
+		case err := <-serverErrors:
+			if !errors.Is(err, http.ErrServerClosed) {
+				runErr = errors.Join(runErr, err)
+			}
+		default:
+		}
+	}
+	if runErr != nil && !errors.Is(runErr, http.ErrServerClosed) {
+		return runErr
 	}
 	logger.Info("api stopped")
 	return nil

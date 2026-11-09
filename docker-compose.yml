@@ -14,10 +14,20 @@ x-app-env: &app-env
   MAX_ATTEMPTS: "3"
   SHUTDOWN_TIMEOUT: 15s
 
+# The Go services run with a read-only root filesystem, no capabilities and no privilege gain.
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: [/tmp]
+
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 200
     environment:
       POSTGRES_USER: processor
       POSTGRES_PASSWORD: processor
@@ -34,6 +44,9 @@ services:
     # Chainguard publishes only a floating tag; pin the digest (MinIO RELEASE.2026-10-23T20-06-51Z).
     image: cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 512
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-local-access-key}
@@ -47,8 +60,11 @@ services:
       retries: 20
 
   elasticmq:
-    image: softwaremill/elasticmq:1.6.12
+    image: softwaremill/elasticmq:1.6.12@sha256:fecd02f7b48f7c28b2dfd3d468e1085878b96c1435b339eca22c652510cd6057
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 256
     environment:
       JAVA_OPTS: "-Xms64m -Xmx256m -XX:ActiveProcessorCount=2"
     volumes:
@@ -67,13 +83,27 @@ services:
         SERVICE: api
     image: async-file-processor-api
     restart: unless-stopped
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 256
+    <<: *hardened
     environment:
       <<: *app-env
+      GOMEMLIMIT: 300MiB
       API_ADDR: ":8080"
+      API_METRICS_ADDR: ":9090"
       # Demo limits. Raise DEMO_MAX_UPLOAD_BYTES for large benchmark files.
       MAX_UPLOAD_BYTES: ${DEMO_MAX_UPLOAD_BYTES:-52428800}
       UPLOAD_RATE_PER_MIN: ${UPLOAD_RATE_PER_MIN:-10}
       UPLOAD_RATE_BURST: ${UPLOAD_RATE_BURST:-5}
+      # Trust CF-Connecting-IP only when the API is reachable solely through Cloudflare.
+      TRUST_CF_CONNECTING_IP: ${TRUST_CF_CONNECTING_IP:-false}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      UPLOAD_IDLE_TIMEOUT: ${UPLOAD_IDLE_TIMEOUT:-30s}
+      UPLOAD_MAX_DURATION: ${UPLOAD_MAX_DURATION:-10m}
+      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-16}
+      MAX_UNFINISHED_JOBS: ${MAX_UNFINISHED_JOBS:-50}
+      MAX_UNFINISHED_PER_CLIENT: ${MAX_UNFINISHED_PER_CLIENT:-3}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
@@ -94,9 +124,16 @@ services:
         SERVICE: worker
     image: async-file-processor-worker
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+    <<: *hardened
     environment:
       <<: *app-env
+      GOMEMLIMIT: 400MiB
       METRICS_ADDR: ":9091"
+      MAX_ERROR_LINES: ${MAX_ERROR_LINES:-50000}
+      MAX_RECORD_BYTES: ${MAX_RECORD_BYTES:-1048576}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
       RETENTION: ${RETENTION:-24h}
       RETENTION_INTERVAL: ${RETENTION_INTERVAL:-10m}

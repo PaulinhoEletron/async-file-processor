@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -60,22 +61,49 @@ func (f *fakeStore) Delete(_ context.Context, key string) error {
 type fakeJobs struct {
 	jobs      map[string]jobs.Job
 	order     []string
+	owners    map[string]string // job id -> hex owner hash
+	clients   map[string]string // job id -> client key
 	failed    map[string]string
 	createErr error
 	listLimit int
+
+	// Unfinished counts: when set they are returned as is, otherwise they are derived from jobs.
+	unfinishedTotal, unfinishedClient *int
+	unfinishedCalls                   int
 }
 
-func (f *fakeJobs) Create(_ context.Context, id, filename, key string) (jobs.Job, error) {
+func (f *fakeJobs) Create(_ context.Context, n jobs.NewJob) (jobs.Job, error) {
 	if f.createErr != nil {
 		return jobs.Job{}, f.createErr
 	}
-	j := jobs.Job{ID: id, Filename: filename, InputKey: key, Status: jobs.StatusPending, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	j := jobs.Job{ID: n.ID, Filename: n.Filename, InputKey: n.InputKey, Status: jobs.StatusPending, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	if f.jobs == nil {
 		f.jobs = map[string]jobs.Job{}
+		f.owners = map[string]string{}
+		f.clients = map[string]string{}
 	}
-	f.jobs[id] = j
-	f.order = append(f.order, id)
+	f.jobs[n.ID] = j
+	f.owners[n.ID] = hex.EncodeToString(n.OwnerHash)
+	f.clients[n.ID] = n.ClientKey
+	f.order = append(f.order, n.ID)
 	return j, nil
+}
+
+func (f *fakeJobs) Unfinished(_ context.Context, clientKey string) (int, int, error) {
+	f.unfinishedCalls++
+	if f.unfinishedTotal != nil && f.unfinishedClient != nil {
+		return *f.unfinishedTotal, *f.unfinishedClient, nil
+	}
+	var total, mine int
+	for id, j := range f.jobs {
+		if j.Status == jobs.StatusPending || j.Status == jobs.StatusProcessing {
+			total++
+			if f.clients[id] == clientKey {
+				mine++
+			}
+		}
+	}
+	return total, mine, nil
 }
 
 func (f *fakeJobs) Get(_ context.Context, id string) (jobs.Job, error) {
@@ -86,11 +114,13 @@ func (f *fakeJobs) Get(_ context.Context, id string) (jobs.Job, error) {
 	return j, nil
 }
 
-func (f *fakeJobs) List(_ context.Context, limit int) ([]jobs.Job, error) {
+func (f *fakeJobs) List(_ context.Context, ownerHash []byte, limit int) ([]jobs.Job, error) {
 	f.listLimit = limit
 	var out []jobs.Job
 	for i := len(f.order) - 1; i >= 0 && len(out) < limit; i-- {
-		out = append(out, f.jobs[f.order[i]])
+		if f.owners[f.order[i]] == hex.EncodeToString(ownerHash) {
+			out = append(out, f.jobs[f.order[i]])
+		}
 	}
 	return out, nil
 }
@@ -302,7 +332,7 @@ func TestUploadQueueFailure(t *testing.T) {
 
 func TestGetJob(t *testing.T) {
 	e := newEnv(1024)
-	j, _ := e.jobs.Create(context.Background(), uuid.NewString(), "a.csv", "k")
+	j, _ := e.jobs.Create(context.Background(), jobs.NewJob{ID: uuid.NewString(), Filename: "a.csv", InputKey: "k"})
 	rec := do(e.h, httptest.NewRequest(http.MethodGet, "/api/jobs/"+j.ID, nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
@@ -336,10 +366,21 @@ func TestGetJob(t *testing.T) {
 	errorBody(t, rec)
 }
 
+// ownerRequest returns a GET request carrying an owner cookie with the given token.
+func ownerRequest(target, token string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.AddCookie(&http.Cookie{Name: ownerCookie, Value: token})
+	return req
+}
+
 func TestListJobs(t *testing.T) {
 	e := newEnv(1024)
+	token, owner, err := newOwnerToken()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	rec := do(e.h, httptest.NewRequest(http.MethodGet, "/api/jobs", nil))
+	rec := do(e.h, ownerRequest("/api/jobs", token))
 	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Fatalf("empty list: %d %q", rec.Code, rec.Body.String())
 	}
@@ -349,10 +390,10 @@ func TestListJobs(t *testing.T) {
 
 	var ids []string
 	for range 3 {
-		j, _ := e.jobs.Create(context.Background(), uuid.NewString(), "a.csv", "k")
+		j, _ := e.jobs.Create(context.Background(), jobs.NewJob{ID: uuid.NewString(), Filename: "a.csv", InputKey: "k", OwnerHash: owner})
 		ids = append(ids, j.ID)
 	}
-	rec = do(e.h, httptest.NewRequest(http.MethodGet, "/api/jobs?limit=2", nil))
+	rec = do(e.h, ownerRequest("/api/jobs?limit=2", token))
 	var list []jobResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
@@ -361,17 +402,125 @@ func TestListJobs(t *testing.T) {
 		t.Fatalf("unexpected list: %+v", list)
 	}
 
-	do(e.h, httptest.NewRequest(http.MethodGet, "/api/jobs?limit=100000", nil))
+	do(e.h, ownerRequest("/api/jobs?limit=100000", token))
 	if e.jobs.listLimit != 200 {
 		t.Fatalf("limit not clamped: %d", e.jobs.listLimit)
 	}
 
 	for _, bad := range []string{"abc", "0", "-1"} {
-		rec = do(e.h, httptest.NewRequest(http.MethodGet, "/api/jobs?limit="+bad, nil))
+		rec = do(e.h, ownerRequest("/api/jobs?limit="+bad, token))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("limit=%s status = %d", bad, rec.Code)
 		}
 		errorBody(t, rec)
+	}
+}
+
+func uploadWithCookie(t *testing.T, e *env, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := upload(t, "file", "a.csv", "id,name\n1,a\n")
+	if token != "" {
+		req.AddCookie(&http.Cookie{Name: ownerCookie, Value: token})
+	}
+	return do(e.h, req)
+}
+
+func listAs(t *testing.T, e *env, token string) []jobResponse {
+	t.Helper()
+	var req *http.Request
+	if token == "" {
+		req = httptest.NewRequest(http.MethodGet, "/api/jobs", nil)
+	} else {
+		req = ownerRequest("/api/jobs", token)
+	}
+	rec := do(e.h, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d", rec.Code)
+	}
+	var list []jobResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	return list
+}
+
+func cookieFrom(rec *httptest.ResponseRecorder) *http.Cookie {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == ownerCookie {
+			return c
+		}
+	}
+	return nil
+}
+
+func TestOwnerCookieIssuedOnFirstUploadAndReused(t *testing.T) {
+	e := newEnv(1 << 20)
+	first := uploadWithCookie(t, e, "")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", first.Code)
+	}
+	c := cookieFrom(first)
+	if c == nil {
+		t.Fatal("no owner cookie on the first upload")
+	}
+	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" || c.MaxAge != 30*24*3600 || c.Secure {
+		t.Fatalf("unexpected cookie attributes: %+v", c)
+	}
+	if raw, err := tokenEncoding.DecodeString(c.Value); err != nil || len(raw) != 32 {
+		t.Fatalf("token is not 32 random bytes: %v", err)
+	}
+	second := uploadWithCookie(t, e, c.Value)
+	if second.Code != http.StatusAccepted || cookieFrom(second) != nil {
+		t.Fatalf("second upload should reuse the cookie: status %d, new cookie %v", second.Code, cookieFrom(second))
+	}
+	if len(listAs(t, e, c.Value)) != 2 {
+		t.Fatal("both uploads must belong to the same owner")
+	}
+	// Only the hash is stored.
+	for id, h := range e.jobs.owners {
+		if h == "" || strings.Contains(h, c.Value) {
+			t.Fatalf("job %s owner = %q", id, h)
+		}
+	}
+}
+
+func TestSecureCookieFlag(t *testing.T) {
+	e := &env{store: &fakeStore{}, jobs: &fakeJobs{}, queue: &fakeQueue{}}
+	e.h = NewHandler(Deps{Store: e.store, Jobs: e.jobs, Queue: e.queue, MaxUploadBytes: 1 << 20, CookieSecure: true})
+	if c := cookieFrom(uploadWithCookie(t, e, "")); c == nil || !c.Secure {
+		t.Fatalf("cookie = %+v, want Secure", c)
+	}
+}
+
+func TestListIsPrivateToEachOwner(t *testing.T) {
+	e := newEnv(1 << 20)
+	a := cookieFrom(uploadWithCookie(t, e, "")).Value
+	b := cookieFrom(uploadWithCookie(t, e, "")).Value
+	if a == b {
+		t.Fatal("two browsers got the same token")
+	}
+	uploadWithCookie(t, e, a)
+
+	if got := listAs(t, e, a); len(got) != 2 {
+		t.Fatalf("owner A sees %d jobs, want 2", len(got))
+	}
+	if got := listAs(t, e, b); len(got) != 1 {
+		t.Fatalf("owner B sees %d jobs, want 1", len(got))
+	}
+	if got := listAs(t, e, ""); len(got) != 0 {
+		t.Fatalf("no cookie sees %d jobs, want 0", len(got))
+	}
+	if got := listAs(t, e, "forged-token"); len(got) != 0 {
+		t.Fatalf("invalid cookie sees %d jobs, want 0", len(got))
+	}
+	rec := do(e.h, httptest.NewRequest(http.MethodGet, "/api/jobs", nil))
+	if strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Fatalf("no cookie must list []: %q", rec.Body.String())
+	}
+	// A job stays reachable by its id (capability link) for any holder of it.
+	id := listAs(t, e, b)[0].ID
+	if rec := do(e.h, httptest.NewRequest(http.MethodGet, "/api/jobs/"+id, nil)); rec.Code != http.StatusOK {
+		t.Fatalf("job by id status = %d", rec.Code)
 	}
 }
 

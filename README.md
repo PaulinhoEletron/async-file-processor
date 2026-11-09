@@ -55,7 +55,8 @@ make down ARGS=-v  # same as make clean
 ```
 
 Only the API is published, and only on `127.0.0.1:8080`. Postgres, MinIO and ElasticMQ are reachable
-only from inside the Compose network. Credentials in `.env.example` are for local use only.
+only from inside the Compose network. Credentials in `.env.example` are for local use only. See
+[SECURITY.md](SECURITY.md) for the threat model and the safeguards.
 
 ## Demo walkthrough
 
@@ -64,7 +65,8 @@ only from inside the Compose network. Credentials in `.env.example` are for loca
 2. Drop the file on the page. It appears in the jobs table as `PENDING`, then `PROCESSING` with row progress,
    then `COMPLETED`.
 3. Click **Summary** to see totals, rows/sec, and errors grouped by field and by rule.
-4. Download `errors.csv` from the Links column: one line per failed rule with the original row.
+4. Download `errors.csv` from the Links column: one line per failed rule, with the original row shown once
+   on the first line of each row.
 5. Upload a file with the wrong header (for example `a,b,c`) to see a permanent failure: the job is
    `FAILED` after one attempt with an explanatory message.
 6. Watch `docker compose logs -f worker` while uploading several files: both worker replicas pick up jobs.
@@ -103,20 +105,36 @@ only from inside the Compose network. Credentials in `.env.example` are for loca
 
 ## Public-demo safeguards
 
-The stack is designed to be exposed to the internet from a single machine.
+The stack is designed to be exposed to the internet from a single machine. [SECURITY.md](SECURITY.md) has the
+threat model and the full list; the settings are summarised here.
 
 | Safeguard | Behaviour | Settings |
 | --- | --- | --- |
 | Upload size limit | Larger uploads are cut off and answered with `413`. | `DEMO_MAX_UPLOAD_BYTES` (compose, default 50 MB), `MAX_UPLOAD_BYTES` (binary, default 500 MB) |
-| Rate limit | Token bucket per client on `POST /api/jobs`; `429` with `Retry-After` when empty. Idle clients are evicted from memory. | `UPLOAD_RATE_PER_MIN` (default 10; `0` disables), `UPLOAD_RATE_BURST` (default 5) |
+| Rate limit | Token bucket per client on `POST /api/jobs`; `429` with `Retry-After` when empty. Idle clients are evicted from memory; when the table is full, new clients share one overflow bucket. | `UPLOAD_RATE_PER_MIN` (default 10; `0` disables), `UPLOAD_RATE_BURST` (default 5) |
+| Client identity | The connection's remote address, or `CF-Connecting-IP` only when trusted (see below). IPv6 clients are keyed by their /64 prefix. | `TRUST_CF_CONNECTING_IP` (default `false`) |
+| Upload deadlines | An upload that sends no data for the idle timeout is cut off with `408`; an upload may not run longer than the maximum duration. | `UPLOAD_IDLE_TIMEOUT` (default `30s`), `UPLOAD_MAX_DURATION` (default `10m`); `0` disables |
+| Upload concurrency | At most this many uploads stream at once; more get `503` with `Retry-After`. | `MAX_CONCURRENT_UPLOADS` (default 16; `0` disables) |
+| Queue caps | Unfinished (`PENDING` or `PROCESSING`) jobs are capped overall (`503`) and per client (`429`), both with `Retry-After`, so one visitor cannot occupy every worker. Counting and inserting are separate statements, so the caps are approximate under concurrency. | `MAX_UNFINISHED_JOBS` (default 50), `MAX_UNFINISHED_PER_CLIENT` (default 3); `0` disables each |
+| Error file cap | `errors.csv` holds at most this many error lines per job; counts in the summary stay exact. | `MAX_ERROR_LINES` (worker, default 50000) |
+| Record size cap | A CSV record larger than this fails the job (non-retryable). | `MAX_RECORD_BYTES` (worker, default 1048576) |
 | Retention | Workers delete finished jobs and their S3 objects older than the retention period, so the disk cannot fill and the job list stays short. | `RETENTION` (default `24h`; `0` disables), `RETENTION_INTERVAL` (default `10m`) |
-| Security headers | `Content-Security-Policy: default-src 'self'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. | |
+| Per-browser job list | `GET /api/jobs` returns only the jobs uploaded from the same browser (an `owner` cookie). | `COOKIE_SECURE` (default `false`; set `true` behind HTTPS) |
+| Security headers | A strict `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, `Cross-Origin-Opener-Policy` and `Cross-Origin-Resource-Policy`; `Cache-Control: no-store` on every `/api/` response. | |
+| Metrics | Served on a separate internal listener, not on the public API port. | `API_METRICS_ADDR` (default `:9090`, not published) |
+| Container limits | Memory, CPU and process limits on every container; the API and workers run with a read-only root filesystem, all capabilities dropped and `no-new-privileges`. | `docker-compose.yml` |
 | Network exposure | Only the API is published, on loopback. | `docker-compose.yml` |
 
-The rate limiter identifies a client by the `CF-Connecting-IP` header when present, otherwise by the
-connection's remote address. `X-Forwarded-For` is deliberately ignored. The header is trusted because the API port is
-bound to `127.0.0.1` and reachable only through the tunnel, which sets it; if you publish the port elsewhere, a
-client could forge it.
+The rate limiter and the job caps identify a client by the connection's remote address. `CF-Connecting-IP` is
+used only when `TRUST_CF_CONNECTING_IP=true`, which is correct only when the API is reachable solely through
+Cloudflare (for example a Cloudflare Tunnel to the loopback port): otherwise any client could forge the header
+and dodge every per-client limit. `X-Forwarded-For` is always ignored. The client key is stored on jobs only as
+a SHA-256 hash.
+
+The `owner` cookie holds 32 random bytes; only its SHA-256 hash is stored in the database. It is `HttpOnly`,
+`SameSite=Lax`, lasts 30 days and is `Secure` when `COOKIE_SECURE=true`. Enable that when the site is served over
+HTTPS (for example through the tunnel). Job ids are unguessable UUIDs and act as capability links: anyone who holds
+a job's id can open its status, report and `errors.csv`, but the list shows a browser only its own jobs.
 
 The retention sweep runs in every worker; it only touches `COMPLETED` and `FAILED` jobs, deletes objects before the
 row, and is idempotent, so concurrent replicas and interrupted sweeps are harmless.
@@ -128,13 +146,13 @@ carries an `X-Request-ID` header (a client-supplied value is echoed if it is sho
 
 | Method and path | Description |
 | --- | --- |
-| `POST /api/jobs` | Upload a CSV (multipart field `file`). `202` with the new job. `400` not a `.csv`, missing `file` field or malformed body; `413` over the size limit; `429` rate limited. |
-| `GET /api/jobs/{id}` | One job. `404` unknown id, `400` malformed id. |
-| `GET /api/jobs?limit=50` | Newest jobs first. `limit` defaults to 50, capped at 200. |
-| `GET /api/jobs/{id}/report` | The job's `summary.json`. `409` until the job is `COMPLETED`. |
-| `GET /api/jobs/{id}/errors.csv` | The errors file as an attachment named `<uploaded name>-errors.csv`. `409` until `COMPLETED`. |
+| `POST /api/jobs` | Upload a CSV (multipart field `file`). `202` with the new job; the first upload from a browser also sets the `owner` cookie. `400` not a `.csv`, filename invalid or longer than 255 characters, missing `file` field, malformed or incomplete body; `408` the upload stalled or ran too long; `413` over the size limit; `429` rate limited or too many of your jobs in progress; `503` too many uploads in progress or the processing queue is full. `429` and `503` carry `Retry-After`. |
+| `GET /api/jobs/{id}` | One job. `404` unknown id, `400` malformed id. The id is a capability link: no cookie is needed. |
+| `GET /api/jobs?limit=50` | The jobs uploaded from this browser (matched by the `owner` cookie), newest first; `[]` without a valid cookie. `limit` defaults to 50, capped at 200. |
+| `GET /api/jobs/{id}/report` | The job's `summary.json`. `409` until the job is `COMPLETED`. Open to anyone holding the id. |
+| `GET /api/jobs/{id}/errors.csv` | The errors file as an attachment named `<uploaded name>-errors.csv`. `409` until `COMPLETED`. Open to anyone holding the id. |
 | `GET /api/sample.csv` | A generated 200-row sample with deliberate errors. |
-| `GET /healthz`, `/readyz`, `/metrics` | Liveness, readiness and Prometheus metrics (see Observability). |
+| `GET /healthz`, `GET /readyz` | Liveness and readiness (see Observability). `/metrics` is not served on this port. |
 
 ```sh
 curl -F file=@scripts/sample.csv http://localhost:8080/api/jobs
@@ -145,6 +163,7 @@ curl -OJ http://localhost:8080/api/jobs/<id>/errors.csv
 
 A job has the fields `id`, `filename`, `status` (`PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`), `total_rows`,
 `valid_rows`, `invalid_rows`, `attempts`, `error_msg`, `created_at`, `updated_at`, `started_at` and `finished_at`.
+All `/api/` responses are sent with `Cache-Control: no-store`.
 
 ## Web UI
 
@@ -155,7 +174,9 @@ no inline scripts so the strict CSP applies).
   non-`.csv` files are rejected and server errors (including `413` and `429`) are displayed.
 - **Generate sample** - downloads the sample CSV.
 - **Jobs table** - refreshes every 2 seconds (paused while the tab is hidden) with status, row progress,
-  attempts and duration. Completed jobs link to a **Summary** panel and to the `errors.csv` download.
+  attempts and duration. Completed jobs link to a **Summary** panel and to the `errors.csv` download. The table
+  shows only the jobs uploaded from this browser; the page reminds visitors not to upload real or personal data.
+  When a job's `errors.csv` was capped, the Summary panel says so.
 
 ## Worker
 
@@ -186,8 +207,8 @@ again. The worker does not run migrations: the API applies them, so Compose star
   second, and so on), so it is redelivered after the backoff.
 - **Attempts** are counted when a worker claims the job (or taken from the message's receive
   count, if higher), so a worker that crashes mid-file also uses up an attempt. After
-  `MAX_ATTEMPTS` (default 3) the job is marked `FAILED` with `giving up after N attempts: ...`
-  and the message is released without being deleted. The queue's redrive policy then moves it
+  `MAX_ATTEMPTS` (default 3) the job is marked `FAILED` with the generic message
+  `processing failed after N attempts` (the detailed error is logged, not stored) and the message is released without being deleted. The queue's redrive policy then moves it
   to the dead-letter queue (`jobs-dlq`) instead of delivering it again. `MAX_ATTEMPTS` must
   equal the queue's `maxReceiveCount` (`deploy/elasticmq.conf`); the worker logs a warning at
   startup if they differ.
@@ -213,8 +234,8 @@ a job carry `job_id` and `attempt`.
 | Endpoint | Where | Meaning |
 | --- | --- | --- |
 | `GET /healthz` | API `:8080`, worker `:9091` (not published) | Liveness: the process is up. |
-| `GET /readyz` | API `:8080` | Readiness: checks Postgres, the S3 bucket and the SQS queue (2s each, in parallel). `200` with `{"status":"ready","checks":{...}}`, or `503` with the error of each failing check. |
-| `GET /metrics` | API `:8080`, worker `:9091` (`METRICS_ADDR`, not published) | Prometheus metrics. |
+| `GET /readyz` | API `:8080` | Readiness: checks Postgres, the S3 bucket and the SQS queue (2s each, in parallel). `200` with `{"status":"ready","checks":{...}}`, or `503` naming each failing check as `unavailable` (the cause is logged, not returned). |
+| `GET /metrics` | API `:9090` (`API_METRICS_ADDR`), worker `:9091` (`METRICS_ADDR`); neither is published | Prometheus metrics. The public API port answers `404`. |
 
 Metrics (plus Go runtime and process metrics):
 
@@ -229,12 +250,13 @@ Metrics (plus Go runtime and process metrics):
 | `jobs_expired_total` | counter | worker; finished jobs deleted by the retention sweep |
 
 Container health checks use a built-in probe (`/app -healthcheck`), because the distroless images contain no shell
-or curl: the API probes `/readyz`, each worker probes its own `/healthz`. Worker metrics are not published by
-Compose; run a worker on the host (see Development) to scrape `http://localhost:9091/metrics`.
+or curl: the API probes `/readyz`, each worker probes its own `/healthz`. Metrics listeners are not published by
+Compose; scrape them from inside the network, or run the binaries on the host (see Development) and use
+`http://localhost:9090/metrics` (API) and `http://localhost:9091/metrics` (worker).
 
 ```sh
 curl http://localhost:8080/readyz
-curl -s http://localhost:8080/metrics | grep -E 'jobs_total|upload_bytes'
+docker compose exec postgres wget -qO- http://api:9090/metrics | grep -E 'jobs_total|upload_bytes'
 ```
 
 ## CSV validation
@@ -273,7 +295,10 @@ other columns are invalid; rows of the wrong width claim nothing.
 `row,field,error,raw`. There is one line per failed rule, so a row with three problems
 appears three times. `row` is the 1-based data row number (the header is not counted), and
 `raw` is the original record re-encoded as CSV. For a row that is not well-formed CSV, `raw`
-is empty. Progress is written to the job (`total_rows`, `valid_rows`, `invalid_rows`)
+is empty. The raw row is shown only on the first line of each row (later lines for the same row leave
+it empty), is cut to 1 KiB with a trailing `…`, and any cell that starts with `=`, `+`, `-`, `@`, a tab or a
+carriage return gets a leading `'` so spreadsheets do not run it as a formula. At most `MAX_ERROR_LINES` lines
+(default 50,000) are written per job; past that the file stops growing while every count keeps counting. Progress is written to the job (`total_rows`, `valid_rows`, `invalid_rows`)
 every 5000 rows and at completion.
 
 ```csv
@@ -286,7 +311,13 @@ row,field,error,raw
 
 `{job id}/summary.json` is written after the errors file has been stored. Error counts are kept
 per field and per `field.rule`, so building the summary uses no per-row memory. `error_count` is
-the number of lines in `errors.csv`; `invalid_rows` is the number of distinct rows with errors.
+the total number of errors found, which equals the number of lines in `errors.csv` unless that file was capped;
+`error_lines_written` is the number of lines it actually holds and `errors_truncated` is `true` when the cap was
+reached. `invalid_rows` is the number of distinct rows with errors. Every count stays exact when the file is capped.
+
+A single CSV record may be at most `MAX_RECORD_BYTES` (default 1 MiB). A larger one, including an unterminated
+quote that would swallow the rest of the file, fails the job as invalid input (`row N is larger than 1 MiB`)
+without being retried, and the worker's memory stays bounded.
 
 ```json
 {
@@ -299,7 +330,9 @@ the number of lines in `errors.csv`; `invalid_rows` is the number of distinct ro
   "errors_by_rule": {"email.invalid_email": 1, "name.required": 1, "amount.negative": 1,
                      "date.invalid_date": 1, "country.invalid_country": 1, "id.duplicate": 1},
   "duration_ms": 3,
-  "rows_per_sec": 3333.3
+  "rows_per_sec": 3333.3,
+  "error_lines_written": 6,
+  "errors_truncated": false
 }
 ```
 
@@ -355,13 +388,35 @@ local installation; if you change `POSTGRES_PORT`, update `DATABASE_URL` to matc
 Defaults for every setting live in `internal/config` and are listed in `.env.example`. Make loads `.env`
 if it exists (copy `.env.example`); when running Go directly, export the variables yourself. The Compose
 services take their settings from `docker-compose.yml`; `UPLOAD_RATE_PER_MIN`, `UPLOAD_RATE_BURST`, `RETENTION`,
-`RETENTION_INTERVAL`, `WORKER_CONCURRENCY` and `DEMO_MAX_UPLOAD_BYTES` can be overridden from the environment or `.env`.
+`RETENTION_INTERVAL`, `WORKER_CONCURRENCY`, `DEMO_MAX_UPLOAD_BYTES`, `TRUST_CF_CONNECTING_IP`, `COOKIE_SECURE`,
+`UPLOAD_IDLE_TIMEOUT`, `UPLOAD_MAX_DURATION`, `MAX_CONCURRENT_UPLOADS`, `MAX_UNFINISHED_JOBS`,
+`MAX_UNFINISHED_PER_CLIENT`, `MAX_ERROR_LINES` and `MAX_RECORD_BYTES` can be overridden from the environment or `.env`.
+
+### Configuration
+
+| Variable | Default | Used by | Meaning |
+| --- | --- | --- | --- |
+| `TRUST_CF_CONNECTING_IP` | `false` | API | Key rate limits and job caps on `CF-Connecting-IP`; enable only behind Cloudflare. |
+| `COOKIE_SECURE` | `false` | API | Mark the `owner` cookie `Secure`; enable behind HTTPS. |
+| `UPLOAD_IDLE_TIMEOUT` | `30s` | API | Cut off an upload that sends no data for this long (`408`). `0` disables. |
+| `UPLOAD_MAX_DURATION` | `10m` | API | Maximum total time of one upload. `0` disables. |
+| `MAX_CONCURRENT_UPLOADS` | `16` | API | Uploads streaming at once; more get `503`. `0` disables. |
+| `MAX_UNFINISHED_JOBS` | `50` | API | `PENDING` plus `PROCESSING` jobs allowed overall; more get `503`. `0` disables. |
+| `MAX_UNFINISHED_PER_CLIENT` | `3` | API | Unfinished jobs allowed per client; more get `429`. `0` disables. |
+| `API_METRICS_ADDR` | `:9090` | API | Listen address of the internal metrics server. |
+| `MAX_ERROR_LINES` | `50000` | worker | Error lines written to `errors.csv` per job. |
+| `MAX_RECORD_BYTES` | `1048576` | worker | Largest CSV record accepted. |
+
+The other settings (`UPLOAD_RATE_PER_MIN`, `UPLOAD_RATE_BURST`, `RETENTION`, `RETENTION_INTERVAL`,
+`MAX_UPLOAD_BYTES`, `WORKER_CONCURRENCY`, `MAX_ATTEMPTS`, `SHUTDOWN_TIMEOUT` and the connection settings) are listed in `.env.example`.
 
 `make e2e` starts the Compose stack (`docker compose up -d --build --wait`) and leaves it running; it does not
 delete data. It uploads the generated sample (200 rows, 20 invalid) and a bad-header file, runs eight 300,000-row
 jobs and asserts that both worker containers processed some of them, then checks the `413` and `429` responses,
-the security headers and the metrics. It gives each upload its own `CF-Connecting-IP` so the per-client rate limit
-does not interfere. It needs port 8080 free for the API container.
+the per-client job cap, the per-browser job list, the security headers and the internal-only metrics. It runs with
+`TRUST_CF_CONNECTING_IP=true` and gives each logical client its own `CF-Connecting-IP`, then restarts the API with
+the default to confirm that a forged header no longer evades the rate limit. It needs port 8080 free for the API
+container.
 
 ## Running it publicly
 
@@ -370,9 +425,11 @@ The stack is meant to run on one machine and be reached from the internet throug
 
 - a `cloudflared` container (or service) on the same host connects out to Cloudflare and forwards a public
   hostname to `http://127.0.0.1:8080`, the only port the stack publishes;
-- Cloudflare terminates TLS and adds the `CF-Connecting-IP` header the rate limiter uses;
+- Cloudflare terminates TLS and adds the `CF-Connecting-IP` header. Set `TRUST_CF_CONNECTING_IP=true` and
+  `COOKIE_SECURE=true` for this setup, and make the tunnel point at the API service only;
 - Postgres, MinIO and ElasticMQ stay on the private Compose network and are never reachable from outside;
 - the size limit, rate limit, retention sweep and security headers above bound what an anonymous visitor can do;
-  the jobs list is shared by all visitors, so the demo is not for confidential files.
+  each visitor's job list is private to their browser, but anyone holding a job id can open its report, and
+  the demo is not for confidential files.
 
 The tunnel setup and the live demo address will be added here once they are in place.

@@ -16,7 +16,9 @@ const (
 	limiterSweepEvery = time.Minute
 	// limiterMaxClients bounds the table. A bucket is only kept while its client is below
 	// the burst, so reaching this means a very large number of clients are active at once.
+	// Clients that arrive while the table is full share one overflow bucket.
 	limiterMaxClients = 100_000
+	overflowKey       = "\x00overflow"
 )
 
 // rateLimiter is a token bucket per client key, safe for concurrent use. A client may send a
@@ -26,6 +28,7 @@ type rateLimiter struct {
 	rate      float64 // tokens added per second
 	burst     float64
 	clients   map[string]*bucket
+	maxKeys   int
 	lastSweep time.Time
 	now       func() time.Time
 }
@@ -40,6 +43,7 @@ func newRateLimiter(perMinute float64, burst int) *rateLimiter {
 		rate:    perMinute / 60,
 		burst:   float64(burst),
 		clients: make(map[string]*bucket),
+		maxKeys: limiterMaxClients,
 		now:     time.Now,
 	}
 }
@@ -52,11 +56,15 @@ func (l *rateLimiter) allow(key string) (bool, time.Duration) {
 	l.sweep(now)
 	b, ok := l.clients[key]
 	if !ok {
-		if len(l.clients) >= limiterMaxClients {
-			return false, time.Duration(float64(time.Second) / l.rate)
+		if len(l.clients) >= l.maxKeys {
+			// Table full: new clients share one bucket instead of being refused outright.
+			key = overflowKey
+			b, ok = l.clients[key]
 		}
-		b = &bucket{tokens: l.burst, last: now}
-		l.clients[key] = b
+		if !ok {
+			b = &bucket{tokens: l.burst, last: now}
+			l.clients[key] = b
+		}
 	}
 	b.tokens = math.Min(l.burst, b.tokens+now.Sub(b.last).Seconds()*l.rate)
 	b.last = now
@@ -82,27 +90,49 @@ func (l *rateLimiter) sweep(now time.Time) {
 	}
 }
 
-// clientIP returns the caller's address. Cloudflare sets CF-Connecting-IP; it is trusted
-// because the API listens on loopback and is reachable only through the tunnel. X-Forwarded-For
-// is never used, since any client can forge it. Anything that is not an IP falls back to the
-// connection's remote address.
-func clientIP(r *http.Request) string {
-	if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
-		if addr, err := netip.ParseAddr(v); err == nil {
-			return addr.Unmap().String()
+// clientKey identifies the caller for rate limiting and job caps.
+//
+// Trust rule: the connection's remote address is always used, unless trustCF is set, in which
+// case a valid CF-Connecting-IP header takes precedence. Enable trustCF only when the API can be
+// reached solely through Cloudflare (for example a Cloudflare Tunnel to a loopback-published
+// port); otherwise any client could forge the header and dodge every per-client limit.
+// X-Forwarded-For is never used, since any client can forge it.
+//
+// The address is normalised so one client cannot obtain many keys: IPv4-mapped IPv6 addresses
+// are unmapped, IPv6 zones are dropped, and IPv6 addresses are keyed by their /64 prefix, the
+// smallest block a single subscriber typically controls.
+func clientKey(r *http.Request, trustCF bool) string {
+	var addr netip.Addr
+	var found bool
+	if trustCF {
+		if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
+			if a, err := netip.ParseAddr(v); err == nil {
+				addr, found = a, true
+			}
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	if !found {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		a, err := netip.ParseAddr(host)
+		if err != nil {
+			return host
+		}
+		addr = a
 	}
-	return host
+	addr = addr.Unmap().WithZone("")
+	if addr.Is6() {
+		return netip.PrefixFrom(addr, 64).Masked().String()
+	}
+	return addr.String()
 }
 
 // rateLimit rejects requests above the per-client limit with a JSON 429 and Retry-After.
-func rateLimit(l *rateLimiter, next http.HandlerFunc) http.HandlerFunc {
+func rateLimit(l *rateLimiter, key func(*http.Request) string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ok, wait := l.allow(clientIP(r))
+		ok, wait := l.allow(key(r))
 		if !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(wait.Seconds()))))
 			writeError(w, http.StatusTooManyRequests, "too many uploads; retry later")

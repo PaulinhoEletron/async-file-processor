@@ -70,11 +70,25 @@ func scan(row pgx.Row) (Job, error) {
 	return j, err
 }
 
-// Create inserts a PENDING job. The caller chooses the id so it can be used in the object key.
-func (r *Repo) Create(ctx context.Context, id, filename, inputKey string) (Job, error) {
+// NewJob holds the values supplied when a job is created.
+type NewJob struct {
+	ID       string // chosen by the caller so it can be used in the object key
+	Filename string
+	InputKey string
+	// OwnerHash is the SHA-256 of the uploading browser's owner token. Nil leaves the job
+	// visible to nobody in the per-owner list.
+	OwnerHash []byte
+	// ClientKey identifies the uploading client (a hash, never a raw address) for the
+	// per-client cap on unfinished jobs.
+	ClientKey string
+}
+
+// Create inserts a PENDING job.
+func (r *Repo) Create(ctx context.Context, n NewJob) (Job, error) {
 	j, err := scan(r.pool.QueryRow(ctx,
-		`INSERT INTO jobs (id, filename, input_key) VALUES ($1, $2, $3) RETURNING `+columns,
-		id, filename, inputKey))
+		`INSERT INTO jobs (id, filename, input_key, owner_hash, client_key)
+		 VALUES ($1, $2, $3, $4, NULLIF($5, '')) RETURNING `+columns,
+		n.ID, n.Filename, n.InputKey, n.OwnerHash, n.ClientKey))
 	if err != nil {
 		return Job{}, fmt.Errorf("create job: %w", err)
 	}
@@ -90,9 +104,10 @@ func (r *Repo) Get(ctx context.Context, id string) (Job, error) {
 	return j, nil
 }
 
-// List returns up to limit jobs, newest first.
-func (r *Repo) List(ctx context.Context, limit int) ([]Job, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+columns+` FROM jobs ORDER BY created_at DESC, id LIMIT $1`, limit)
+// List returns up to limit jobs uploaded by the owner with the given token hash, newest first.
+func (r *Repo) List(ctx context.Context, ownerHash []byte, limit int) ([]Job, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+columns+` FROM jobs WHERE owner_hash = $1 ORDER BY created_at DESC, id LIMIT $2`, ownerHash, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
@@ -109,6 +124,17 @@ func (r *Repo) List(ctx context.Context, limit int) ([]Job, error) {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
 	return out, nil
+}
+
+// Unfinished counts PENDING and PROCESSING jobs: all of them, and those created by clientKey.
+func (r *Repo) Unfinished(ctx context.Context, clientKey string) (total, forClient int, err error) {
+	err = r.pool.QueryRow(ctx,
+		`SELECT count(*), count(*) FILTER (WHERE client_key = $1) FROM jobs
+		 WHERE status IN ('PENDING', 'PROCESSING')`, clientKey).Scan(&total, &forClient)
+	if err != nil {
+		return 0, 0, fmt.Errorf("count unfinished jobs: %w", err)
+	}
+	return total, forClient, nil
 }
 
 // MarkProcessing atomically claims a PENDING or PROCESSING job (PROCESSING lets a redelivered

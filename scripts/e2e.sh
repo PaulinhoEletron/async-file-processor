@@ -38,15 +38,18 @@ done
 
 echo "== starting the stack"
 # Defaults, not whatever a local .env sets, so the limits below are the documented ones.
+# CF-Connecting-IP is trusted for this run so that each logical client below gets its own rate
+# limit bucket; a later section restarts the API without it to prove a forged header is ignored.
 export UPLOAD_RATE_PER_MIN=10 UPLOAD_RATE_BURST=5 WORKER_CONCURRENCY=4 RETENTION=24h
+export TRUST_CF_CONNECTING_IP=true MAX_UNFINISHED_PER_CLIENT=3 MAX_UNFINISHED_JOBS=50
 unset DEMO_MAX_UPLOAD_BYTES
 docker compose up -d --build --wait >/dev/null || fail "docker compose up failed"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/readyz" || true)" = 200 ] || fail "/readyz did not return 200"
 echo "ok: all services are healthy"
 LIMIT=52428800
 
-# upload_as <client ip> <file> <output>: POST a CSV as a given client (the rate limit is per
-# client, and the API trusts CF-Connecting-IP, so each logical client gets its own bucket).
+# upload_as <client ip> <file> <output>: POST a CSV as a given client (limits are per client, and
+# this run trusts CF-Connecting-IP, so each logical client gets its own bucket).
 upload_as() {
 	curl -s -o "$3" -w '%{http_code}' -H "CF-Connecting-IP: $1" -F "file=@$2;filename=$(basename "$2")" "$API/api/jobs"
 }
@@ -128,20 +131,60 @@ for i in 1 2 3 4 5; do upload_as 198.51.102.3 "$TMP/bad.csv" "$TMP/limit.json" >
 curl -s -D "$TMP/limit.headers" -o "$TMP/limit.json" -H "CF-Connecting-IP: 198.51.102.3" -F "file=@$TMP/bad.csv" "$API/api/jobs" >/dev/null
 grep -q '^HTTP/.* 429' "$TMP/limit.headers" || fail "sixth rapid upload was not rate limited"
 grep -qi '^retry-after: [0-9]' "$TMP/limit.headers" || fail "429 has no Retry-After header"
-python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["error"]' "$TMP/limit.json" || fail "429 body is not a JSON error"
+expect "rate limit message" "$(json "$TMP/limit.json" 'd["error"]')" "too many uploads; retry later"
 echo "ok: rapid uploads are limited with 429 and Retry-After"
+
+echo "== per-client cap on unfinished jobs"
+for i in 1 2 3; do
+	expect "slow upload $i from one client" "$(upload_as 198.51.103.1 "$TMP/batch.csv" "$TMP/cap$i.json")" 202
+done
+expect "fourth upload while three are unfinished" "$(upload_as 198.51.103.1 "$TMP/batch.csv" "$TMP/cap4.json")" 429
+expect "cap message" "$(json "$TMP/cap4.json" 'd["error"]')" "you have too many jobs in progress, try again when one finishes"
+expect "another client is not affected" "$(upload_as 198.51.103.2 "$TMP/sample.csv" "$TMP/cap5.json")" 202
+for i in 1 2 3; do wait_for_status "$(json "$TMP/cap$i.json" 'd["id"]')" COMPLETED "$TMP/capdone.json"; done
+echo "ok: unfinished jobs are capped per client"
+
+echo "== job list is private to the uploading browser"
+curl -s -c "$TMP/jarA" -o "$TMP/own.json" -H "CF-Connecting-IP: 198.51.104.1" -F "file=@$TMP/sample.csv" "$API/api/jobs" >/dev/null
+OWN=$(json "$TMP/own.json" 'd["id"]')
+grep -q 'owner' "$TMP/jarA" || fail "no owner cookie was issued"
+curl -sf -b "$TMP/jarA" "$API/api/jobs" -o "$TMP/listA.json"
+expect "owner sees its job" "$(json "$TMP/listA.json" 'any(j["id"]=="'"$OWN"'" for j in d)')" True
+expect "owner sees only its own jobs" "$(json "$TMP/listA.json" 'len(d)')" 1
+printf '#HttpOnly_localhost\tFALSE\t/\tFALSE\t0\towner\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n' >"$TMP/jarB"
+curl -sf -b "$TMP/jarB" "$API/api/jobs" -o "$TMP/listB.json"
+expect "another browser sees nothing" "$(json "$TMP/listB.json" 'len(d)')" 0
+curl -sf "$API/api/jobs" -o "$TMP/listC.json"
+expect "no cookie sees nothing" "$(json "$TMP/listC.json" 'len(d)')" 0
+expect "job link works without the cookie" "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/jobs/$OWN")" 200
+
+echo "== forged CF-Connecting-IP is ignored by default"
+# Recreate the API with the default trust setting (header ignored).
+TRUST_CF_CONNECTING_IP=false docker compose up -d --wait api >/dev/null || fail "could not restart the api"
+CODES=""
+for i in 1 2 3 4 5 6; do
+	CODES="$CODES $(upload_as "203.0.113.$((i + 100))" "$TMP/bad.csv" "$TMP/forge.json")"
+done
+case "$CODES" in *429) ;; *) fail "rotating CF-Connecting-IP evaded the limit:$CODES" ;; esac
+echo "ok: six uploads with rotating forged headers ended in 429 (codes:$CODES)"
 
 echo "== security headers"
 curl -s -D "$TMP/ui.headers" -o /dev/null "$API/"
-for h in 'content-security-policy: default-src' 'x-content-type-options: nosniff' 'x-frame-options: DENY'; do
+for h in 'content-security-policy: default-src' 'x-content-type-options: nosniff' 'x-frame-options: DENY' \
+	'permissions-policy:' 'cross-origin-opener-policy: same-origin' 'cross-origin-resource-policy: same-origin'; do
 	grep -qi "^$h" "$TMP/ui.headers" || fail "UI response lacks header $h"
 done
+curl -s -D "$TMP/api.headers" -o /dev/null "$API/api/jobs/$ID/errors.csv"
+grep -qi '^cache-control: no-store' "$TMP/api.headers" || fail "API response lacks Cache-Control: no-store"
 echo "ok: security headers present"
 
 echo "== metrics"
-curl -sf "$API/metrics" -o "$TMP/api-metrics.txt" || fail "could not fetch api metrics"
+expect "public /metrics status" "$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics")" 404
+curl -sf --max-time 2 http://127.0.0.1:9090/metrics >/dev/null 2>&1 && fail "API metrics port is published on the host"
+# The API image has no shell or curl; read the internal listener from another container.
+docker compose exec -T postgres wget -qO- http://api:9090/metrics >"$TMP/api-metrics.txt" || fail "could not fetch api metrics"
 grep -q 'jobs_total{status="created"} [1-9]' "$TMP/api-metrics.txt" || fail 'api metrics lack jobs_total{status="created"}'
 grep -q '^upload_bytes_total [1-9]' "$TMP/api-metrics.txt" || fail "upload_bytes_total did not move"
-echo "ok: metrics exposed"
+echo "ok: metrics are internal only"
 
 echo "E2E PASS"

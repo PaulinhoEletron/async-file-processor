@@ -23,10 +23,13 @@ type Store interface {
 
 // Jobs persists job records.
 type Jobs interface {
-	Create(ctx context.Context, id, filename, inputKey string) (jobs.Job, error)
+	Create(ctx context.Context, n jobs.NewJob) (jobs.Job, error)
 	Get(ctx context.Context, id string) (jobs.Job, error)
-	List(ctx context.Context, limit int) ([]jobs.Job, error)
+	// List returns the newest jobs created by the owner with the given token hash.
+	List(ctx context.Context, ownerHash []byte, limit int) ([]jobs.Job, error)
 	Fail(ctx context.Context, id, msg string) error
+	// Unfinished counts PENDING and PROCESSING jobs: all of them and those of one client.
+	Unfinished(ctx context.Context, clientKey string) (total, forClient int, err error)
 }
 
 // Queue publishes work for the worker.
@@ -48,16 +51,33 @@ type Deps struct {
 	UI fs.FS
 	// Checks are the dependency probes behind /readyz, keyed by name (for example "db").
 	Checks map[string]Checker
-	// Metrics receives upload and job counters and is served at /metrics. Nil uses a private set.
+	// Metrics receives upload and job counters. They are not served by this handler; expose
+	// them on a separate, internal listener. Nil uses a private set.
 	Metrics *metrics.Metrics
 	// UploadRatePerMin is the sustained POST /api/jobs rate allowed per client and UploadRateBurst
 	// the largest burst. A rate of 0 disables the limit.
 	UploadRatePerMin float64
 	UploadRateBurst  int
+	// TrustCFConnectingIP keys per-client limits on the CF-Connecting-IP header instead of the
+	// connection's remote address. Set it only when the API is reachable solely via Cloudflare.
+	TrustCFConnectingIP bool
+	// CookieSecure marks the owner cookie Secure. Enable it when the site is served over HTTPS.
+	CookieSecure bool
+	// UploadIdleTimeout cuts off an upload that sends no data for this long, and UploadMaxDuration
+	// bounds the whole upload. Zero disables each.
+	UploadIdleTimeout time.Duration
+	UploadMaxDuration time.Duration
+	// MaxConcurrentUploads caps uploads streaming at once (503 beyond it). Zero disables.
+	MaxConcurrentUploads int
+	// MaxUnfinishedJobs and MaxUnfinishedPerClient cap PENDING+PROCESSING jobs overall (503) and
+	// per client (429). Zero disables each.
+	MaxUnfinishedJobs      int
+	MaxUnfinishedPerClient int
 }
 
 type api struct {
 	Deps
+	slots chan struct{} // semaphore for concurrent uploads; nil when uncapped
 }
 
 // NewHandler returns the API router wrapped in request id, logging and recovery middleware.
@@ -68,18 +88,23 @@ func NewHandler(d Deps) http.Handler {
 	if d.Metrics == nil {
 		d.Metrics = metrics.New()
 	}
-	a := &api{d}
+	a := &api{Deps: d}
+	if d.MaxConcurrentUploads > 0 {
+		a.slots = make(chan struct{}, d.MaxConcurrentUploads)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	mux.HandleFunc("GET /readyz", a.readyz)
-	mux.Handle("GET /metrics", d.Metrics.Handler())
-	create := a.createJob
+	// Admission order for uploads: rate limit, then the concurrent-upload slot, then the
+	// queue caps, and only then is the body read.
+	create := a.queueCaps(a.createJob)
+	create = a.uploadSlots(create)
 	if d.UploadRatePerMin > 0 {
 		burst := max(d.UploadRateBurst, 1)
-		create = rateLimit(newRateLimiter(d.UploadRatePerMin, burst), create)
+		create = rateLimit(newRateLimiter(d.UploadRatePerMin, burst), a.clientKey, create)
 	}
 	mux.HandleFunc("POST /api/jobs", create)
 	mux.HandleFunc("GET /api/jobs/{id}", a.getJob)

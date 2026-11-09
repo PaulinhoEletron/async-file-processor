@@ -89,7 +89,8 @@ func run(logger *slog.Logger) error {
 
 	m := metrics.New()
 	repo := jobs.NewRepo(pool)
-	var proc worker.Processor = processor.New(store, repo, logger)
+	var proc worker.Processor = processor.New(store, repo, logger,
+		processor.WithMaxErrorLines(cfg.MaxErrorLines), processor.WithMaxRecordBytes(cfg.MaxRecordBytes))
 	if cfg.FailRate > 0 {
 		logger.Warn("fault injection enabled; for development only", "fail_rate", cfg.FailRate)
 		proc = worker.FaultyProcessor{Next: proc, Rate: cfg.FailRate}

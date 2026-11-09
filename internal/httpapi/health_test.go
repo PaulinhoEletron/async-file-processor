@@ -50,6 +50,9 @@ func TestReadyzOneFailing(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
+	if strings.Contains(rec.Body.String(), "bucket unreachable") {
+		t.Fatalf("failure detail leaked: %s", rec.Body)
+	}
 	var body struct {
 		Status string
 		Checks map[string]string
@@ -57,7 +60,7 @@ func TestReadyzOneFailing(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Status != "unavailable" || body.Checks["s3"] != "bucket unreachable" || body.Checks["db"] != "ok" || body.Checks["sqs"] != "ok" {
+	if body.Status != "unavailable" || body.Checks["s3"] != "unavailable" || body.Checks["db"] != "ok" || body.Checks["sqs"] != "ok" {
 		t.Fatalf("unexpected body: %s", rec.Body)
 	}
 }
@@ -117,11 +120,17 @@ func TestMetricsEndpointMovesAfterUpload(t *testing.T) {
 		t.Fatalf("upload_bytes_total = %v, want %d", got, len(content))
 	}
 
+	// Metrics are not served on the public handler.
 	rec := do(h, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/metrics status = %d", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("/metrics status = %d, want 404", rec.Code)
 	}
-	body := rec.Body.String()
+	// They are still collected and available from the shared registry.
+	var out strings.Builder
+	mrec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(mrec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	out.WriteString(mrec.Body.String())
+	body := out.String()
 	for _, want := range []string{
 		`jobs_total{status="created"} 1`,
 		`jobs_total{status="completed"} 0`,
@@ -132,7 +141,7 @@ func TestMetricsEndpointMovesAfterUpload(t *testing.T) {
 		"go_goroutines",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("/metrics is missing %q", want)
+			t.Errorf("metrics are missing %q", want)
 		}
 	}
 }
