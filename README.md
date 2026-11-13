@@ -9,6 +9,10 @@ The whole system runs locally with Docker Compose. Object storage (MinIO), the q
 which speaks the SQS API) and Postgres stand in for S3, SQS and a managed database. The Go code uses the AWS SDK
 against standard S3 and SQS APIs, so only endpoints and credentials would change in a cloud deployment.
 
+**Live demo:** [files.paulofsantos.com](https://files.paulofsantos.com). Download the sample CSV there, upload it
+and watch it being processed. The demo runs on a laptop behind a Cloudflare Tunnel, so it may be offline at times;
+uploads are limited to 50 MB and deleted after 24 hours.
+
 ## Architecture
 
 ```mermaid
@@ -49,6 +53,7 @@ The first `make up` compiles the Go services inside Docker and takes a few minut
 build cache. `make up` returns once every container reports healthy.
 
 ```sh
+make public        # same stack plus the Cloudflare Tunnel connector (see Running it publicly)
 make down          # stop the stack, keep the data
 make clean         # stop the stack and delete all data (docker compose down -v)
 make down ARGS=-v  # same as make clean
@@ -396,6 +401,7 @@ services take their settings from `docker-compose.yml`; `UPLOAD_RATE_PER_MIN`, `
 
 | Variable | Default | Used by | Meaning |
 | --- | --- | --- | --- |
+| `CLOUDFLARE_TUNNEL_TOKEN` | empty | `make public` | Token of the Cloudflare Tunnel; keep it in `.env` only. |
 | `TRUST_CF_CONNECTING_IP` | `false` | API | Key rate limits and job caps on `CF-Connecting-IP`; enable only behind Cloudflare. |
 | `COOKIE_SECURE` | `false` | API | Mark the `owner` cookie `Secure`; enable behind HTTPS. |
 | `UPLOAD_IDLE_TIMEOUT` | `30s` | API | Cut off an upload that sends no data for this long (`408`). `0` disables. |
@@ -420,16 +426,29 @@ container.
 
 ## Running it publicly
 
-The stack is meant to run on one machine and be reached from the internet through
-[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/), without opening any inbound port:
+The live demo runs on one machine and is reached from the internet through
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/). The
+`cloudflared` connector runs as a Compose service (profile `public`), connects out to Cloudflare and forwards
+one public hostname to the API container. No inbound port is opened on the host.
 
-- a `cloudflared` container (or service) on the same host connects out to Cloudflare and forwards a public
-  hostname to `http://127.0.0.1:8080`, the only port the stack publishes;
-- Cloudflare terminates TLS and adds the `CF-Connecting-IP` header. Set `TRUST_CF_CONNECTING_IP=true` and
-  `COOKIE_SECURE=true` for this setup, and make the tunnel point at the API service only;
-- Postgres, MinIO and ElasticMQ stay on the private Compose network and are never reachable from outside;
-- the size limit, rate limit, retention sweep and security headers above bound what an anonymous visitor can do;
+To run your own copy publicly (needs a domain on Cloudflare):
+
+1. In the Cloudflare dashboard, open **Zero Trust → Networks → Tunnels** and create a tunnel of type
+   **Cloudflared**. Choose the Docker install option and copy the token after `--token`; do not run the command.
+2. Add a public hostname (for example `files.example.com`) with service URL `http://api:8080`. The connector
+   runs on the Compose network, so it reaches the API by its service name.
+3. Put the token in `.env` as `CLOUDFLARE_TUNNEL_TOKEN=...`. `.env` is git-ignored; never commit the token.
+4. Run `make public`. It refuses to start without a token, builds and starts the stack with the connector, and
+   returns once everything is healthy. `make down` stops it all, including the connector.
+
+What this setup relies on:
+
+- `make public` sets `TRUST_CF_CONNECTING_IP=true`, so rate limits and job caps key on the visitor's real IP
+  from Cloudflare, and `COOKIE_SECURE=true`, because Cloudflare serves the site over HTTPS. Plain `make up` keeps
+  both off.
+- Only the API is behind the tunnel. Postgres, MinIO and ElasticMQ stay on the private Compose network, and the
+  API's internal metrics port is not routed. Each tunnel hostname should point at the API service and nothing else.
+- The 50 MB demo upload cap is below Cloudflare's 100 MB request-body limit on the free plan.
+- The size limit, rate limit, retention sweep and security headers above bound what an anonymous visitor can do;
   each visitor's job list is private to their browser, but anyone holding a job id can open its report, and
   the demo is not for confidential files.
-
-The tunnel setup and the live demo address will be added here once they are in place.
